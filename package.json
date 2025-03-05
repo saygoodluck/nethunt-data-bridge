@@ -1,0 +1,20 @@
+{
+  "name": "nethunt-data-bridge",
+  "version": "1.0.0",
+  "description": "Service for synchronize data via Clickhouse and NetHunt crm",
+  "author": "Kostia https://github.com/saygoodluck",
+  "license": "ISC",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@clickhouse/client": "^1.10.1",
+    "axios": "^1.8.1",
+    "express": "^4.21.2",
+    "dotenv": "^16.4.7",
+    "node-cron": "^3.0.3",
+    "ssh2": "^1.16.0"
+  }
+}
