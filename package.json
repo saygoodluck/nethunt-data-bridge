@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Service for synchronize data via Clickhouse and NetHunt crm",
   "author": "Kostia https://github.com/saygoodluck",
-  "license": "ISC",
+  "license": "MIT",
   "main": "index.js",
   "type": "module",
   "scripts": {

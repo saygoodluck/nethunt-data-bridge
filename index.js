@@ -106,12 +106,12 @@ const authenticate = (req, res, next) => {
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Missing or invalid Authorization header' });
+        return res.status(401).json({error: 'Missing or invalid Authorization header'});
     }
 
     const apiKey = authHeader.split(' ')[1];
     if (apiKey !== process.env.NETHUNT_API_KEY) {
-        return res.status(401).json({ error: 'Invalid API key' });
+        return res.status(401).json({error: 'Invalid API key'});
     }
 
     next();
@@ -178,15 +178,33 @@ cron.schedule('0 * * * *', async () => {
 // @formatter:off
 const clickHouseQuery = `
     SELECT uh.UserID as FundistUserID,
-        argMax(uh.Login, LastLoginDate) as Login,
-        argMax(uh.Name, LastLoginDate) as FirstName,
-        argMax(uh.LastName, LastLoginDate) as LastName,
-        argMax(uh.MiddleName, LastLoginDate) as MiddleName,
-        argMax(uh.Email, LastLoginDate) as Email,
-        argMax(uh.Phone, LastLoginDate) as PhoneNumber,
-        if(argMax(uh.PhoneVerified, LastLoginDate) = 1, 'Verified', 'Unverified') as PhoneVerified,
-        argMax(uh.AlternativePhone, LastLoginDate) as AlternativePhone
+        argMax(uh.Login, uh.LastLoginDate) as Login,
+        argMax(uh.Name, uh.LastLoginDate) as FirstName,
+        argMax(uh.LastName, uh.LastLoginDate) as LastName,
+        argMax(uh.MiddleName, uh.LastLoginDate) as MiddleName,
+        argMax(uh.Email, uh.LastLoginDate) as Email,
+        argMax(uh.Phone, uh.LastLoginDate) as PhoneNumber,
+        if(argMax(uh.PhoneVerified, uh.LastLoginDate) = 1, 'Verified', 'Unverified') as PhoneVerified,
+        argMax(uh.AlternativePhone, uh.LastLoginDate) as AlternativePhone,
+        argMax(uh.Gender, uh.LastLoginDate) AS Gender,
+        argMax(uh.Language, uh.LastLoginDate) AS Language,
+        argMax(c.Name, uh.LastLoginDate) AS Country,
+        argMax(uh.City, uh.LastLoginDate) AS City,
+        argMax(uh.Timezone, uh.LastLoginDate) AS Timezone,
+        argMax(uh.Address, uh.LastLoginDate) AS Address,
+        argMax(uh.PostalCode, uh.LastLoginDate) AS PostalCode,
+        argMax(uh.PlaceOfBirth, uh.LastLoginDate) AS PlaceOfBirth,
+        argMax(uh.CityOfRegistration, uh.LastLoginDate) AS CityOfRegistration,
+        argMax(uh.AddressOfRegistration, uh.LastLoginDate) AS AddressOfRegistration,
+        argMax(uh.LastCreditDate, uh.LastLoginDate) AS LastCreditDate,
+        argMax(uh.RegistrationDate, uh.LastLoginDate) AS RegistrationDate,
+        max(uh.LastLoginDate) AS LastLoginDate,
+        if(argMax(uh.PEP, uh.LastLoginDate) = 1, 'PEP', '') AS PEP,
+        if(argMax(uh.Status, uh.LastLoginDate) = 1, 'Active', 'Inactive') AS AccountStatus,
+        any(p.TotalDeposit) as TotalDeposit
     FROM UserHistory uh
+    JOIN CountriesNew c ON c.ID = uh.CountryID
+    LEFT JOIN (SELECT IDUser, SUM(AmountNotRounded) AS TotalDeposit FROM Payments p WHERE Status = 100 GROUP BY IDUser) p ON uh.UserID = p.IDUser
     GROUP BY uh.UserID
     ORDER BY uh.UserID DESC
     LIMIT {batchSize: UInt32} OFFSET {offset: UInt32}
@@ -370,14 +388,19 @@ function mapRecordFields(record) {
         Gender: record.Gender,
         Language: record.Language,
         Country: record.Country,
-        State: record.State,
         City: record.City,
         Timezone: record.Timezone,
         Address: record.Address,
         PostalCode: record.PostalCode,
         PlaceOfBirth: record.PlaceOfBirth,
         CityOfRegistration: record.CityOfRegistration,
-        AddressOfRegistration: record.AddressOfRegistration
+        AddressOfRegistration: record.AddressOfRegistration,
+        LastCreditDate: record.LastCreditDate,
+        RegistrationDate: record.RegistrationDate,
+        LastLoginDate: record.LastLoginDate,
+        PEP: record.PEP,
+        AccountStatus: record.AccountStatus,
+        TotalDeposit: record.TotalDeposit
     };
 }
 
