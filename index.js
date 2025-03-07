@@ -178,29 +178,29 @@ cron.schedule('0 * * * *', async () => {
 // @formatter:off
 const clickHouseQuery = `
     SELECT uh.UserID as FundistUserID,
-        argMax(uh.Login, uh.LastLoginDate) as Login,
-        argMax(uh.Name, uh.LastLoginDate) as FirstName,
-        argMax(uh.LastName, uh.LastLoginDate) as LastName,
-        argMax(uh.MiddleName, uh.LastLoginDate) as MiddleName,
-        argMax(uh.Email, uh.LastLoginDate) as Email,
-        argMax(uh.Phone, uh.LastLoginDate) as PhoneNumber,
-        if(argMax(uh.PhoneVerified, uh.LastLoginDate) = 1, 'Verified', 'Unverified') as PhoneVerified,
-        argMax(uh.AlternativePhone, uh.LastLoginDate) as AlternativePhone,
-        argMax(uh.Gender, uh.LastLoginDate) AS Gender,
-        argMax(uh.Language, uh.LastLoginDate) AS Language,
-        argMax(c.Name, uh.LastLoginDate) AS Country,
-        argMax(uh.City, uh.LastLoginDate) AS City,
-        argMax(uh.Timezone, uh.LastLoginDate) AS Timezone,
-        argMax(uh.Address, uh.LastLoginDate) AS Address,
-        argMax(uh.PostalCode, uh.LastLoginDate) AS PostalCode,
-        argMax(uh.PlaceOfBirth, uh.LastLoginDate) AS PlaceOfBirth,
-        argMax(uh.CityOfRegistration, uh.LastLoginDate) AS CityOfRegistration,
-        argMax(uh.AddressOfRegistration, uh.LastLoginDate) AS AddressOfRegistration,
-        argMax(uh.LastCreditDate, uh.LastLoginDate) AS LastCreditDate,
-        argMax(uh.RegistrationDate, uh.LastLoginDate) AS RegistrationDate,
-        max(uh.LastLoginDate) AS LastLoginDate,
-        if(argMax(uh.PEP, uh.LastLoginDate) = 1, 'PEP', '') AS PEP,
-        if(argMax(uh.Status, uh.LastLoginDate) = 1, 'Active', 'Inactive') AS AccountStatus,
+        argMax(uh.Login, uh.RecordTime) as Login,
+        argMax(uh.Name, uh.RecordTime) as FirstName,
+        argMax(uh.LastName, uh.RecordTime) as LastName,
+        argMax(uh.MiddleName, uh.RecordTime) as MiddleName,
+        argMax(uh.Email, uh.RecordTime) as Email,
+        argMax(uh.Phone, uh.RecordTime) as PhoneNumber,
+        if(argMax(uh.PhoneVerified, uh.RecordTime) = 1, 'Verified', 'Unverified') as PhoneVerified,
+        argMax(uh.AlternativePhone, uh.RecordTime) as AlternativePhone,
+        argMax(uh.Gender, uh.RecordTime) AS Gender,
+        argMax(uh.Language, uh.RecordTime) AS Language,
+        argMax(c.Name, uh.RecordTime) AS Country,
+        argMax(uh.City, uh.RecordTime) AS City,
+        argMax(uh.Timezone, uh.RecordTime) AS Timezone,
+        argMax(uh.Address, uh.RecordTime) AS Address,
+        argMax(uh.PostalCode, uh.RecordTime) AS PostalCode,
+        argMax(uh.PlaceOfBirth, uh.RecordTime) AS PlaceOfBirth,
+        argMax(uh.CityOfRegistration, uh.RecordTime) AS CityOfRegistration,
+        argMax(uh.AddressOfRegistration, uh.RecordTime) AS AddressOfRegistration,
+        argMax(uh.LastCreditDate, uh.RecordTime) AS LastCreditDate,
+        argMax(uh.RegistrationDate, uh.RecordTime) AS RegistrationDate,
+        argMax(uh.LastLoginDate, uh.RecordTime) AS LastLoginDate,
+        if(argMax(uh.PEP, uh.RecordTime) = 1, 'PEP', '') AS PEP,
+        if(argMax(uh.Status, uh.RecordTime) = 1, 'Active', 'Inactive') AS AccountStatus,
         any(p.TotalDeposit) as TotalDeposit
     FROM UserHistory uh
     JOIN CountriesNew c ON c.ID = uh.CountryID
@@ -448,5 +448,16 @@ async function withRetry(fn, config) {
 
 function logProgress(total, created, updated) {
     const line = `Progress: ${total} | Created: ${created} | Updated: ${updated}`;
-    process.stdout.write(process.stdout.isTTY ? `\r${line}` : `${line}\n`);
+    if (process.stdout.isTTY) {
+        process.stdout.clearLine();
+        process.stdout.cursorTo(0);
+        process.stdout.write(line);
+    } else {
+        process.stdout.write(line + '\n');
+    }
 }
+
+// function logProgress(total, created, updated) {
+//     const line = `Progress: ${total} | Created: ${created} | Updated: ${updated}`;
+//     process.stdout.write(process.stdout.isTTY ? `\r${line}` : `${line}\n`);
+// }
