@@ -201,10 +201,11 @@ const clickHouseQuery = `
         argMax(uh.LastLoginDate, uh.RecordTime) AS LastLoginDate,
         if(argMax(uh.PEP, uh.RecordTime) = 1, 'PEP', '') AS PEP,
         if(argMax(uh.Status, uh.RecordTime) = 1, 'Active', 'Inactive') AS AccountStatus,
-        any(p.TotalDeposit) as TotalDeposit
+        any(t.TotalDeposit) as TotalDeposit,
+        any(t.TotalWithdraw) as TotalWithdraw
     FROM UserHistory uh
     JOIN CountriesNew c ON c.ID = uh.CountryID
-    LEFT JOIN (SELECT IDUser, SUM(AmountNotRounded) AS TotalDeposit FROM Payments p WHERE Status = 100 GROUP BY IDUser) p ON uh.UserID = p.IDUser
+    LEFT JOIN (SELECT UserID, sum(Deposit) / 100 AS TotalDeposit, sum(Withdraw) / 100 AS TotalWithdraw FROM Turnovers t GROUP BY UserID) t ON uh.UserID = t.UserID
     GROUP BY uh.UserID
     ORDER BY uh.UserID DESC
     LIMIT {batchSize: UInt32} OFFSET {offset: UInt32}
@@ -400,7 +401,8 @@ function mapRecordFields(record) {
         LastLoginDate: record.LastLoginDate,
         PEP: record.PEP,
         AccountStatus: record.AccountStatus,
-        TotalDeposit: record.TotalDeposit
+        TotalDeposit: record.TotalDeposit,
+        TotalWithdraw: record.TotalWithdraw
     };
 }
 
