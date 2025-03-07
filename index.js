@@ -171,7 +171,7 @@ process.on('SIGINT', async () => {
 
 // Scheduled sync
 cron.schedule('0 * * * *', async () => {
-    console.log(`${new Date()} UTC+0 | Running scheduled task...`);
+    console.log(`${new Date()} | Running scheduled task...`);
     await syncRecords().catch(console.error);
 });
 
@@ -438,10 +438,15 @@ async function withRetry(fn, config) {
     }
 }
 
+// function logProgress(total, created, updated) {
+//     process.stdout.clearLine();
+//     process.stdout.cursorTo(0);
+//     process.stdout.write(
+//         `Progress: ${total} | Created: ${created} | Updated: ${updated}`
+//     );
+// }
+
 function logProgress(total, created, updated) {
-    process.stdout.clearLine();
-    process.stdout.cursorTo(0);
-    process.stdout.write(
-        `Progress: ${total} | Created: ${created} | Updated: ${updated}`
-    );
+    const line = `Progress: ${total} | Created: ${created} | Updated: ${updated}`;
+    process.stdout.write(process.stdout.isTTY ? `\r${line}` : `${line}\n`);
 }
