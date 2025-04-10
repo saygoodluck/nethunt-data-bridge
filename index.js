@@ -7,6 +7,7 @@ import express from 'express';
 import cron from 'node-cron';
 import axios from 'axios';
 import {performance} from 'node:perf_hooks';
+import {createClient as createRedisClient} from 'redis';
 
 const app = express();
 const sshClient = new Client();
@@ -51,12 +52,21 @@ const forwardConfig = {
 
 const MAX_CONCURRENT_REQUESTS = Number(process.env.MAX_CONCURRENT_REQUESTS) || 5;
 const BATCH_SIZE = Number(process.env.BATCH_SIZE) || 100;
+const SYNC_INTERVAL = Number(process.env.SYNC_INTERVAL) || 1;
 const RETRY_CONFIG = {
     retries: Number(process.env.RETRY_RETRIES) || 3,
     factor: Number(process.env.RETRY_FACTOR) || 2,
     minTimeout: Number(process.env.RETRY_MIN_TIMEOUT) || 1000,
     maxTimeout: Number(process.env.RETRY_MAX_TIMEOUT) || 10000
 };
+
+const redisClient = await createRedisClient({
+    url: "redis://localhost:6379",
+    database: 0
+})
+    .on('error', (err) => console.log('Redis Client Error', err))
+    .on('connect', () => console.log('Connected to Redis'))
+    .connect();
 
 let clickhouse;
 let tunnelServer = null;
@@ -181,21 +191,14 @@ const clickHouseQuery = `
         argMax(uh.Login, uh.RecordTime) as Login,
         argMax(uh.Name, uh.RecordTime) as FirstName,
         argMax(uh.LastName, uh.RecordTime) as LastName,
-        argMax(uh.MiddleName, uh.RecordTime) as MiddleName,
         argMax(uh.Email, uh.RecordTime) as Email,
         argMax(uh.Phone, uh.RecordTime) as PhoneNumber,
         if(argMax(uh.PhoneVerified, uh.RecordTime) = 1, 'Verified', 'Unverified') as PhoneVerified,
-        argMax(uh.AlternativePhone, uh.RecordTime) as AlternativePhone,
         argMax(uh.Gender, uh.RecordTime) AS Gender,
         argMax(uh.Language, uh.RecordTime) AS Language,
         argMax(c.Name, uh.RecordTime) AS Country,
         argMax(uh.City, uh.RecordTime) AS City,
         argMax(uh.Timezone, uh.RecordTime) AS Timezone,
-        argMax(uh.Address, uh.RecordTime) AS Address,
-        argMax(uh.PostalCode, uh.RecordTime) AS PostalCode,
-        argMax(uh.PlaceOfBirth, uh.RecordTime) AS PlaceOfBirth,
-        argMax(uh.CityOfRegistration, uh.RecordTime) AS CityOfRegistration,
-        argMax(uh.AddressOfRegistration, uh.RecordTime) AS AddressOfRegistration,
         argMax(uh.LastCreditDate, uh.RecordTime) AS LastCreditDate,
         argMax(uh.RegistrationDate, uh.RecordTime) AS RegistrationDate,
         argMax(uh.LastLoginDate, uh.RecordTime) AS LastLoginDate,
@@ -206,6 +209,7 @@ const clickHouseQuery = `
     FROM UserHistory uh
     JOIN CountriesNew c ON c.ID = uh.CountryID
     LEFT JOIN (SELECT UserID, sum(Deposit) / 100 AS TotalDeposit, sum(Withdraw) / 100 AS TotalWithdraw FROM Turnovers t GROUP BY UserID) t ON uh.UserID = t.UserID
+    WHERE uh.LastUpdated > now() - INTERVAL {interval: UInt32} HOUR
     GROUP BY uh.UserID
     ORDER BY uh.UserID DESC
     LIMIT {batchSize: UInt32} OFFSET {offset: UInt32}
@@ -255,7 +259,7 @@ async function fetchRecordsBatch(offset) {
         const result = await clickhouse.query({
             query: clickHouseQuery,
             format: 'JSONEachRow',
-            query_params: {batchSize: BATCH_SIZE, offset}
+            query_params: {batchSize: BATCH_SIZE, offset: offset, interval: SYNC_INTERVAL}
         });
         return await result.json();
     } catch (err) {
@@ -286,17 +290,27 @@ async function processChunk(chunk) {
 
 async function processRecord(record) {
     try {
-        const [existing] = await searchNetHuntRecord(record.FundistUserID);
-
-        if (!existing) {
-            await createNetHuntRecord(record);
-            return {action: 'created'};
+        const cachedNetHuntUserId = await redisClient.get(record.FundistUserID);
+        if (cachedNetHuntUserId) {
+            await updateNetHuntRecord(cachedNetHuntUserId, record);
+            return {action: 'updated'};
         }
 
-        await updateNetHuntRecord(existing.id, record);
-        return {action: 'updated'};
+        const [existing] = await searchNetHuntRecord(record.FundistUserID);
+        if (existing) {
+            await updateNetHuntRecord(existing.id, record);
+            await redisClient.set(record.FundistUserID, existing.id);
+            return {action: 'updated'};
+        }
+
+        const {recordId} = await createNetHuntRecord(record);
+        await redisClient.set(record.FundistUserID, recordId);
+        return {action: 'created'};
     } catch (err) {
-        console.error(`Error processing record ${record.FundistUserID}:`, err.message);
+        console.error(`Error processing ${record.FundistUserID}:`, {
+            message: err.message,
+            stack: err.stack
+        });
         throw err;
     }
 }
@@ -380,22 +394,15 @@ function mapRecordFields(record) {
         Login: record.Login,
         FirstName: record.FirstName,
         LastName: record.LastName,
-        MiddleName: record.MiddleName,
         Email: record.Email,
         PhoneNumber: record.PhoneNumber,
         PhoneVerified: record.PhoneVerified,
-        AlternativePhone: record.AlternativePhone,
         DateOfBirth: record.DateOfBirth,
         Gender: record.Gender,
         Language: record.Language,
         Country: record.Country,
         City: record.City,
         Timezone: record.Timezone,
-        Address: record.Address,
-        PostalCode: record.PostalCode,
-        PlaceOfBirth: record.PlaceOfBirth,
-        CityOfRegistration: record.CityOfRegistration,
-        AddressOfRegistration: record.AddressOfRegistration,
         LastCreditDate: record.LastCreditDate,
         RegistrationDate: record.RegistrationDate,
         LastLoginDate: record.LastLoginDate,
@@ -440,14 +447,6 @@ async function withRetry(fn, config) {
     }
 }
 
-// function logProgress(total, created, updated) {
-//     process.stdout.clearLine();
-//     process.stdout.cursorTo(0);
-//     process.stdout.write(
-//         `Progress: ${total} | Created: ${created} | Updated: ${updated}`
-//     );
-// }
-
 function logProgress(total, created, updated) {
     const line = `Progress: ${total} | Created: ${created} | Updated: ${updated}`;
     if (process.stdout.isTTY) {
@@ -458,6 +457,14 @@ function logProgress(total, created, updated) {
         process.stdout.write(line + '\n');
     }
 }
+
+// function logProgress(total, created, updated) {
+//     process.stdout.clearLine();
+//     process.stdout.cursorTo(0);
+//     process.stdout.write(
+//         `Progress: ${total} | Created: ${created} | Updated: ${updated}`
+//     );
+// }
 
 // function logProgress(total, created, updated) {
 //     const line = `Progress: ${total} | Created: ${created} | Updated: ${updated}`;
