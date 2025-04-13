@@ -1,19 +1,23 @@
 import {createClient} from '@clickhouse/client';
-import 'dotenv/config';
-import fs from 'fs';
 import {Client} from 'ssh2';
-import net from 'net';
+import {createClient as createRedisClient} from 'redis';
 import express from 'express';
 import cron from 'node-cron';
 import axios from 'axios';
+
+import fs from 'fs';
+import net from 'net';
 import {performance} from 'node:perf_hooks';
-import {createClient as createRedisClient} from 'redis';
+
+import 'dotenv/config';
 
 const app = express();
 const sshClient = new Client();
 const PORT = process.env.PORT || 3000;
 
-// Validate environment variables
+let clickhouseClient;
+let tunnelServer = null;
+
 const requiredEnvVars = [
     'CLICKHOUSE_HOST', 'CLICKHOUSE_PORT', 'CLICKHOUSE_USER',
     'CLICKHOUSE_PASSWORD', 'CLICKHOUSE_DATABASE', 'SSH_HOST',
@@ -50,26 +54,27 @@ const forwardConfig = {
     dstPort: dbServer.port
 };
 
-const MAX_CONCURRENT_REQUESTS = Number(process.env.MAX_CONCURRENT_REQUESTS) || 5;
-const BATCH_SIZE = Number(process.env.BATCH_SIZE) || 100;
-const SYNC_INTERVAL = Number(process.env.SYNC_INTERVAL) || 1;
-const RETRY_CONFIG = {
-    retries: Number(process.env.RETRY_RETRIES) || 3,
-    factor: Number(process.env.RETRY_FACTOR) || 2,
-    minTimeout: Number(process.env.RETRY_MIN_TIMEOUT) || 1000,
-    maxTimeout: Number(process.env.RETRY_MAX_TIMEOUT) || 10000
-};
+const appConfig = {
+    maxConcurrentRequests: Number(process.env.MAX_CONCURRENT_REQUESTS) || 5,
+    batchSize: Number(process.env.BATCH_SIZE) || 100,
+    syncInterval: process.env.SYNC_INTERVAL || 1,
+    retry: {
+        retries: Number(process.env.RETRY_RETRIES) || 3,
+        factor: Number(process.env.RETRY_FACTOR) || 2,
+        minTimeout: Number(process.env.RETRY_MIN_TIMEOUT) || 1000,
+        maxTimeout: Number(process.env.RETRY_MAX_TIMEOUT) || 10000
+    }
+}
 
-const redisClient = await createRedisClient({
+const redisConfig = {
     url: "redis://localhost:6379",
     database: 0
-})
+}
+
+const redisClient = await createRedisClient(redisConfig)
     .on('error', (err) => console.log('Redis Client Error', err))
     .on('connect', () => console.log('Connected to Redis'))
     .connect();
-
-let clickhouse;
-let tunnelServer = null;
 
 const setupSSHTunnel = () => new Promise((resolve, reject) => {
     sshClient.on('ready', () => {
@@ -97,7 +102,7 @@ const setupSSHTunnel = () => new Promise((resolve, reject) => {
             if (err) return reject(err);
             console.log(`SSH tunnel ready on ${forwardConfig.srcHost}:${forwardConfig.srcPort}`);
 
-            clickhouse = createClient({
+            clickhouseClient = createClient({
                 url: `http://${forwardConfig.srcHost}:${forwardConfig.srcPort}`,
                 username: dbServer.user,
                 password: dbServer.password,
@@ -105,7 +110,7 @@ const setupSSHTunnel = () => new Promise((resolve, reject) => {
             });
 
             // Test connection
-            clickhouse.query({query: 'SELECT 1'})
+            clickhouseClient.query({query: 'SELECT 1'})
                 .then(() => resolve())
                 .catch(reject);
         });
@@ -133,7 +138,7 @@ app.get('/', async (req, res) => {
 
 app.get('/sync', authenticate, async (req, res) => {
     try {
-        const result = await syncRecords();
+        const result = await executeSync();
         res.json({
             status: 'success',
             message: 'Sync completed',
@@ -168,9 +173,7 @@ sshClient.on('close', () => {
 process.on('SIGINT', async () => {
     console.log('\nGracefully shutting down...');
     try {
-        await clickhouse?.close();
-        sshClient.end();
-        tunnelServer?.close();
+        await clickhouseClient?.close();
         console.log('Connections closed');
         process.exit(0);
     } catch (err) {
@@ -180,44 +183,28 @@ process.on('SIGINT', async () => {
 });
 
 // Scheduled sync
-cron.schedule('0 * * * *', async () => {
+cron.schedule('0,30 * * * *', async () => {
     console.log(`${new Date()} | Running scheduled task...`);
-    await syncRecords().catch(console.error);
+    await executeSync().catch(console.error);
 });
 
-// @formatter:off
-const clickHouseQuery = `
-    SELECT uh.UserID as FundistUserID,
-        argMax(uh.Login, uh.RecordTime) as Login,
-        argMax(uh.Name, uh.RecordTime) as FirstName,
-        argMax(uh.LastName, uh.RecordTime) as LastName,
-        argMax(uh.Email, uh.RecordTime) as Email,
-        argMax(uh.Phone, uh.RecordTime) as PhoneNumber,
-        if(argMax(uh.PhoneVerified, uh.RecordTime) = 1, 'Verified', 'Unverified') as PhoneVerified,
-        argMax(uh.Gender, uh.RecordTime) AS Gender,
-        argMax(uh.Language, uh.RecordTime) AS Language,
-        argMax(c.Name, uh.RecordTime) AS Country,
-        argMax(uh.City, uh.RecordTime) AS City,
-        argMax(uh.Timezone, uh.RecordTime) AS Timezone,
-        argMax(uh.LastCreditDate, uh.RecordTime) AS LastCreditDate,
-        argMax(uh.RegistrationDate, uh.RecordTime) AS RegistrationDate,
-        argMax(uh.LastLoginDate, uh.RecordTime) AS LastLoginDate,
-        if(argMax(uh.PEP, uh.RecordTime) = 1, 'PEP', '') AS PEP,
-        if(argMax(uh.Status, uh.RecordTime) = 1, 'Active', 'Inactive') AS AccountStatus,
-        any(t.TotalDeposit) as TotalDeposit,
-        any(t.TotalWithdraw) as TotalWithdraw
-    FROM UserHistory uh
-    JOIN CountriesNew c ON c.ID = uh.CountryID
-    LEFT JOIN (SELECT UserID, sum(Deposit) / 100 AS TotalDeposit, sum(Withdraw) / 100 AS TotalWithdraw FROM Turnovers t GROUP BY UserID) t ON uh.UserID = t.UserID
-    WHERE uh.LastUpdated > now() - INTERVAL {interval: UInt32} HOUR
-    GROUP BY uh.UserID
-    ORDER BY uh.UserID DESC
-    LIMIT {batchSize: UInt32} OFFSET {offset: UInt32}
-`;
-// @formatter:on
+async function executeSync() {
+    const start = performance.now();
+    const result = await syncRecords();
+    const duration = performance.now() - start;
+    console.log(`Duration: ${(duration / 1000).toFixed(2)} seconds`);
+
+    const syncData = {
+        finishedAt: new Date(),
+        totalSynced: result.totalSynced,
+        duration: duration,
+        createdRecords: result.createdRecords,
+        updatedRecords: result.updatedRecords
+    }
+    await sendMetrics(syncData);
+}
 
 async function syncRecords() {
-    const start = performance.now();
     let offset = 0;
     let totalSynced = 0;
     let createdRecords = 0;
@@ -226,11 +213,13 @@ async function syncRecords() {
     try {
         console.log('Starting sync...');
 
+        const {finishedAt} = await getLastSyncTime();
+        const interval = calculateInterval(finishedAt);
         while (true) {
-            const records = await fetchRecordsBatch(offset);
+            const records = await fetchRecordsBatch(offset, interval);
             if (records.length === 0) break;
 
-            const chunks = chunkArray(records, MAX_CONCURRENT_REQUESTS);
+            const chunks = chunkArray(records, appConfig.maxConcurrentRequests);
 
             for (const chunk of chunks) {
                 const results = await processChunk(chunk);
@@ -241,25 +230,73 @@ async function syncRecords() {
                 logProgress(totalSynced, createdRecords, updatedRecords);
             }
 
-            offset += BATCH_SIZE;
+            offset += appConfig.batchSize;
         }
 
-        const duration = performance.now() - start;
         console.log(`\nSync completed.`);
-        console.log(`Duration: ${(duration / 1000).toFixed(2)} seconds`);
-        return {totalSynced, createdRecords, updatedRecords, duration};
+        return {totalSynced, createdRecords, updatedRecords};
     } catch (err) {
         console.error('Sync failed:', err);
         throw err;
     }
 }
 
-async function fetchRecordsBatch(offset) {
+async function getLastSyncTime() {
+    const response = await axios.get(
+        `https://nethunt.com/api/v1/zapier/triggers/new-record/${process.env.NETHUNT_UTILS_FOLDER_ID}`,
+        {
+            auth: {
+                username: process.env.NETHUNT_USER,
+                password: process.env.NETHUNT_API_KEY
+            }
+        }
+    );
+    return response.data[0]?.fields;
+}
+
+function calculateInterval(lastSyncTime) {
+    const DEFAULT_INTERVAL = process.env.SYNC_INTERVAL_MINUTES || 60;
+    if (!lastSyncTime) {
+        return DEFAULT_INTERVAL;
+    }
+
+    const now = new Date();
+    const lastSync = new Date(lastSyncTime);
+
+    const diffMs = now.getTime() - lastSync.getTime();
+    const diffMinutes = Math.ceil(diffMs / (1000 * 60));
+    console.info(`Last sync time detected: ${lastSyncTime}. Interval in minutes: ${diffMinutes}`)
+
+    return Math.max(diffMinutes, DEFAULT_INTERVAL);
+}
+
+async function sendMetrics(data) {
     try {
-        const result = await clickhouse.query({
+        const response = await axios.post(
+            `https://nethunt.com/api/v1/zapier/actions/create-record/${process.env.NETHUNT_UTILS_FOLDER_ID}`,
+            {
+                fields: data,
+                timeZone: "Europe/Warsaw"
+            },
+            {
+                auth: {
+                    username: process.env.NETHUNT_USER,
+                    password: process.env.NETHUNT_API_KEY
+                }
+            }
+        );
+        return response.data;
+    } catch (err) {
+        console.error('Error writing last sync time:', err);
+    }
+}
+
+async function fetchRecordsBatch(offset, interval) {
+    try {
+        const result = await clickhouseClient.query({
             query: clickHouseQuery,
             format: 'JSONEachRow',
-            query_params: {batchSize: BATCH_SIZE, offset: offset, interval: SYNC_INTERVAL}
+            query_params: {batchSize: appConfig.batchSize, offset: offset, interval: interval}
         });
         return await result.json();
     } catch (err) {
@@ -273,7 +310,7 @@ async function processChunk(chunk) {
     let updated = 0;
 
     const results = await Promise.allSettled(
-        chunk.map(record => withRetry(() => processRecord(record), RETRY_CONFIG))
+        chunk.map(record => withRetry(() => processRecord(record), appConfig.retry))
     );
 
     for (const result of results) {
@@ -387,7 +424,6 @@ async function updateNetHuntRecord(recordId, data) {
     }
 }
 
-// Field Mapping
 function mapRecordFields(record) {
     return {
         FundistUserID: record.FundistUserID,
@@ -458,15 +494,33 @@ function logProgress(total, created, updated) {
     }
 }
 
-// function logProgress(total, created, updated) {
-//     process.stdout.clearLine();
-//     process.stdout.cursorTo(0);
-//     process.stdout.write(
-//         `Progress: ${total} | Created: ${created} | Updated: ${updated}`
-//     );
-// }
-
-// function logProgress(total, created, updated) {
-//     const line = `Progress: ${total} | Created: ${created} | Updated: ${updated}`;
-//     process.stdout.write(process.stdout.isTTY ? `\r${line}` : `${line}\n`);
-// }
+// @formatter:off
+const clickHouseQuery = `
+    SELECT uh.UserID as FundistUserID,
+           argMax(uh.Login, uh.RecordTime) as Login,
+           argMax(uh.Name, uh.RecordTime) as FirstName,
+           argMax(uh.LastName, uh.RecordTime) as LastName,
+           argMax(uh.Email, uh.RecordTime) as Email,
+           argMax(uh.Phone, uh.RecordTime) as PhoneNumber,
+           if(argMax(uh.PhoneVerified, uh.RecordTime) = 1, 'Verified', 'Unverified') as PhoneVerified,
+           argMax(uh.Gender, uh.RecordTime) AS Gender,
+           argMax(uh.Language, uh.RecordTime) AS Language,
+           argMax(c.Name, uh.RecordTime) AS Country,
+           argMax(uh.City, uh.RecordTime) AS City,
+           argMax(uh.Timezone, uh.RecordTime) AS Timezone,
+           argMax(uh.LastCreditDate, uh.RecordTime) AS LastCreditDate,
+           argMax(uh.RegistrationDate, uh.RecordTime) AS RegistrationDate,
+           argMax(uh.LastLoginDate, uh.RecordTime) AS LastLoginDate,
+           if(argMax(uh.PEP, uh.RecordTime) = 1, 'PEP', '') AS PEP,
+           if(argMax(uh.Status, uh.RecordTime) = 1, 'Active', 'Inactive') AS AccountStatus,
+           any(t.TotalDeposit) as TotalDeposit,
+           any(t.TotalWithdraw) as TotalWithdraw
+    FROM UserHistory uh
+             JOIN CountriesNew c ON c.ID = uh.CountryID
+             LEFT JOIN (SELECT UserID, sum(Deposit) / 100 AS TotalDeposit, sum(Withdraw) / 100 AS TotalWithdraw FROM Turnovers t GROUP BY UserID) t ON uh.UserID = t.UserID
+    WHERE uh.LastUpdated > now() - INTERVAL {interval: UInt32} MINUTE
+    GROUP BY uh.UserID
+    ORDER BY uh.UserID DESC
+    LIMIT {batchSize: UInt32} OFFSET {offset: UInt32}
+`;
+// @formatter:on
