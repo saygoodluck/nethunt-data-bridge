@@ -19,6 +19,9 @@ const PORT = process.env.PORT || 3000;
 
 let clickhouseClient;
 let tunnelServer = null;
+// the process stays alive while this is false; it is not a fatal condition
+let clickhouseReady = false;
+let connecting = false;
 
 // Local development: ClickHouse is reachable directly, no bastion in between
 const skipSSHTunnel = process.env.SKIP_SSH_TUNNEL === '1';
@@ -88,6 +91,14 @@ const appConfig = {
     }
 }
 
+const connectRetry = {
+    minTimeout: Number(process.env.CONNECT_MIN_TIMEOUT) || 2000,
+    maxTimeout: Number(process.env.CONNECT_MAX_TIMEOUT) || 60000,
+    factor: 2,
+    // only bother the chat once it is clearly not a blip
+    alertAfterAttempts: Number(process.env.CONNECT_ALERT_AFTER) || 5
+};
+
 const redisConfig = {
     url: process.env.REDIS_URL || 'redis://localhost:6379',
     database: Number(process.env.REDIS_DATABASE) || 0
@@ -146,10 +157,31 @@ const telegramBot = createTelegramBot({
     }
 });
 
+// A persistent listener is required: ssh2 emitting 'error' with nothing
+// attached would take the process down.
+sshClient.on('error', (err) => console.error('SSH client error:', err.message));
+
 const setupSSHTunnel = () => new Promise((resolve, reject) => {
-    sshClient.on('ready', () => {
+    // one-shot listeners, removed on both outcomes: `on` here would leave a
+    // handler behind on every reconnect, and each one builds another tunnel
+    const cleanup = () => {
+        sshClient.removeListener('ready', onReady);
+        sshClient.removeListener('error', onError);
+    };
+
+    const fail = (err) => {
+        cleanup();
+        reject(err);
+    };
+
+    function onError(err) {
+        fail(err);
+    }
+
+    function onReady() {
         if (tunnelServer) {
             tunnelServer.close();
+            tunnelServer = null;
         }
 
         tunnelServer = net.createServer((socket) => {
@@ -168,16 +200,75 @@ const setupSSHTunnel = () => new Promise((resolve, reject) => {
             );
         });
 
-        tunnelServer.listen(forwardConfig.srcPort, forwardConfig.srcHost, (err) => {
-            if (err) return reject(err);
+        // listen() reports failures through the error event, never through its
+        // callback, so EADDRINUSE used to surface as an uncaught exception
+        tunnelServer.once('error', fail);
+
+        tunnelServer.listen(forwardConfig.srcPort, forwardConfig.srcHost, () => {
             console.log(`SSH tunnel ready on ${forwardConfig.srcHost}:${forwardConfig.srcPort}`);
 
             connectClickHouse(`http://${forwardConfig.srcHost}:${forwardConfig.srcPort}`)
-                .then(() => resolve())
-                .catch(reject);
+                .then(() => {
+                    cleanup();
+                    resolve();
+                })
+                .catch(fail);
         });
-    }).on('error', reject).connect(buildTunnelConfig());
+    }
+
+    sshClient.once('ready', onReady);
+    sshClient.once('error', onError);
+    sshClient.connect(buildTunnelConfig());
 });
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Keeps trying instead of exiting: under a container restart policy a hard exit
+// turns an unreachable bastion into a crash loop, which reports nothing and
+// silences the startup notice.
+async function connectWithRetry() {
+    if (connecting) return;
+    connecting = true;
+
+    let attempt = 0;
+    let alerted = false;
+
+    while (!clickhouseReady) {
+        try {
+            await (skipSSHTunnel ? connectDirectly() : setupSSHTunnel());
+            clickhouseReady = true;
+
+            if (alerted) {
+                await telegramBot.sendAlert(
+                    `\u{1F7E2} <b>ClickHouse connection restored</b>\n\nRecovered after ${attempt} failed attempts.`
+                );
+            }
+        } catch (err) {
+            attempt++;
+            const delay = Math.min(
+                connectRetry.minTimeout * Math.pow(connectRetry.factor, attempt - 1),
+                connectRetry.maxTimeout
+            );
+            console.error(
+                `ClickHouse connection failed (attempt ${attempt}): ${err.message}. ` +
+                `Retrying in ${(delay / 1000).toFixed(0)}s`
+            );
+
+            if (attempt === connectRetry.alertAfterAttempts && !alerted) {
+                alerted = true;
+                await telegramBot.sendAlert(
+                    `\u{1F534} <b>Cannot reach ClickHouse</b>\n\n` +
+                    `<code>${err.message}</code>\n\n` +
+                    `Failed ${attempt} times. Retrying quietly; you will be told when it recovers.`
+                );
+            }
+
+            await sleep(delay);
+        }
+    }
+
+    connecting = false;
+}
 
 const authenticate = (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -195,10 +286,23 @@ const authenticate = (req, res, next) => {
 };
 
 app.get('/', async (req, res) => {
-    res.json({status: 'ok', message: 'Service is operational'});
+    // deliberately 200 even while connecting: the container is alive, and
+    // failing this check would make the orchestrator restart it pointlessly
+    res.json({
+        status: 'ok',
+        message: 'Service is operational',
+        clickhouse: clickhouseReady ? 'connected' : 'connecting'
+    });
 });
 
 app.get('/sync', authenticate, async (req, res) => {
+    if (!clickhouseReady) {
+        return res.status(503).json({
+            status: 'error',
+            message: 'ClickHouse is not connected yet'
+        });
+    }
+
     try {
         const result = await executeSync();
         res.json({
@@ -216,23 +320,20 @@ app.get('/sync', authenticate, async (req, res) => {
     }
 });
 
-(skipSSHTunnel ? connectDirectly() : setupSSHTunnel())
-    .then(() => {
-        app.listen(PORT, () => {
-            console.log(`Server running on http://localhost:${PORT}`);
-        });
-        telegramBot.startPolling();
-        telegramBot.notifyStartup().catch(console.error);
-    })
-    .catch(err => {
-        console.error('Initialization failed:', err);
-        process.exit(1);
-    });
+// The HTTP server and the bot come up first, so /status and the chat can
+// explain a connection problem instead of the container dying silently.
+app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+});
+telegramBot.startPolling();
+telegramBot.notifyStartup().catch(console.error);
+connectWithRetry().catch(err => console.error('Connection loop stopped:', err));
 
 sshClient.on('close', () => {
     if (skipSSHTunnel) return;
     console.log('SSH connection closed. Reconnecting...');
-    setupSSHTunnel().catch(console.error);
+    clickhouseReady = false;
+    connectWithRetry().catch(err => console.error('Reconnect loop stopped:', err));
 });
 
 process.on('SIGINT', async () => {
@@ -251,6 +352,11 @@ process.on('SIGINT', async () => {
 
 // Scheduled sync
 cron.schedule('0,30 * * * *', async () => {
+    if (!clickhouseReady) {
+        // otherwise every run would write a failed-sync record into NetHunt
+        console.warn('Skipping scheduled sync: ClickHouse is not connected');
+        return;
+    }
     console.log(`${new Date()} | Running scheduled task...`);
     await executeSync().catch(console.error);
 });

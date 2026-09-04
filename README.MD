@@ -205,8 +205,25 @@ needs. The service falls back to `SSH_PRIVATE_KEY` (raw) and then to
 `SSH_KEY_PATH`, so bare-metal runs keep working unchanged.
 
 Note that an env var is readable by anyone with access to the Dokploy UI or
-API. If that is too broad, mount the key as a file instead and keep using
-`SSH_KEY_PATH`.
+API. If that is too broad -- or if the key already lives on the server, which
+is the usual case when the server's own public key was handed to the ClickHouse
+admins -- mount it instead. `docker-compose.yml` carries a commented volume for
+exactly that; set `SSH_KEY_PATH` to the path inside the container and make sure
+the file is readable by uid 1000.
+
+### Startup when the bastion is unreachable
+
+The service does not exit when it cannot connect. Under a container restart
+policy exiting turns an unreachable bastion into a crash loop, which reports
+nothing and never gets far enough to send the startup notice.
+
+Instead the HTTP server and the bot start immediately and the connection is
+retried in the background with exponential backoff, capped at
+`CONNECT_MAX_TIMEOUT`. `GET /` stays 200 -- the container really is alive --
+but reports `clickhouse: connecting`, `GET /sync` answers 503, and scheduled
+syncs are skipped rather than writing a failed-sync record into NetHunt every
+half hour. After `CONNECT_ALERT_AFTER` attempts the chat is told once, and told
+again when the connection comes back.
 
 ### What to whitelist
 

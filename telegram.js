@@ -266,6 +266,8 @@ export function createTelegramBot({redisClient, runSync, getStatus}) {
 
     return {
         enabled: telegramEnabled,
+        // for operational events that are not sync results
+        sendAlert: send,
         notifySyncResult,
         sendDailyReport,
         notifyStartup,
