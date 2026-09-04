@@ -1,0 +1,51 @@
+# Local development contour: everything the service talks to, except NetHunt itself.
+# The service runs on the host (npm run dev) so IDEA can attach a debugger to it.
+#
+#   npm run dev:up    - start ClickHouse, Redis and the NetHunt mock
+#   npm run dev       - run the service against them
+#   npm run dev:down  - stop and wipe
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: nethunt-dev-clickhouse
+    environment:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: bridge
+      CLICKHOUSE_PASSWORD: bridge
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"
+    volumes:
+      # *.sql here run once, on an empty data volume
+      - ./dev/clickhouse/init:/docker-entrypoint-initdb.d:ro
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: nethunt-dev-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  nethunt-mock:
+    image: node:20-alpine
+    container_name: nethunt-dev-mock
+    working_dir: /app
+    command: node server.js
+    environment:
+      PORT: 3010
+    ports:
+      - "3010:3010"
+    volumes:
+      - ./dev/nethunt-mock:/app:ro

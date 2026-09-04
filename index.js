@@ -18,12 +18,19 @@ const PORT = process.env.PORT || 3000;
 let clickhouseClient;
 let tunnelServer = null;
 
+// Local development: ClickHouse is reachable directly, no bastion in between
+const skipSSHTunnel = process.env.SKIP_SSH_TUNNEL === '1';
+const netHuntBaseUrl = process.env.NETHUNT_BASE_URL || 'https://nethunt.com/api/v1/zapier';
+
 const requiredEnvVars = [
     'CLICKHOUSE_HOST', 'CLICKHOUSE_PORT', 'CLICKHOUSE_USER',
-    'CLICKHOUSE_PASSWORD', 'CLICKHOUSE_DATABASE', 'SSH_HOST',
-    'SSH_PORT', 'SSH_USER', 'NETHUNT_FOLDER_ID', 'NETHUNT_USER',
-    'NETHUNT_API_KEY'
+    'CLICKHOUSE_PASSWORD', 'CLICKHOUSE_DATABASE', 'NETHUNT_FOLDER_ID',
+    'NETHUNT_USER', 'NETHUNT_API_KEY'
 ];
+
+if (!skipSSHTunnel) {
+    requiredEnvVars.push('SSH_HOST', 'SSH_PORT', 'SSH_USER');
+}
 
 requiredEnvVars.forEach(env => {
     if (!process.env[env]) {
@@ -40,12 +47,24 @@ const dbServer = {
     database: process.env.CLICKHOUSE_DATABASE
 };
 
-const tunnelConfig = {
+// In a container there is no key file to point at, so allow passing it directly.
+// Base64 first: env editors mangle the newlines a PEM key needs.
+const readPrivateKey = () => {
+    if (process.env.SSH_PRIVATE_KEY_B64) {
+        return Buffer.from(process.env.SSH_PRIVATE_KEY_B64, 'base64');
+    }
+    if (process.env.SSH_PRIVATE_KEY) {
+        return process.env.SSH_PRIVATE_KEY;
+    }
+    return fs.readFileSync(process.env.SSH_KEY_PATH || './id_ed25519');
+};
+
+const buildTunnelConfig = () => ({
     host: process.env.SSH_HOST,
     port: Number(process.env.SSH_PORT),
     username: process.env.SSH_USER,
-    privateKey: fs.readFileSync(process.env.SSH_KEY_PATH || './id_ed25519')
-};
+    privateKey: readPrivateKey()
+});
 
 const forwardConfig = {
     srcHost: '127.0.0.1',
@@ -58,6 +77,7 @@ const appConfig = {
     maxConcurrentRequests: Number(process.env.MAX_CONCURRENT_REQUESTS) || 5,
     batchSize: Number(process.env.BATCH_SIZE) || 100,
     syncInterval: process.env.SYNC_INTERVAL || 1,
+    cacheTtlSeconds: Number(process.env.CACHE_TTL_SECONDS) || 14 * 24 * 60 * 60,
     retry: {
         retries: Number(process.env.RETRY_RETRIES) || 3,
         factor: Number(process.env.RETRY_FACTOR) || 2,
@@ -67,14 +87,34 @@ const appConfig = {
 }
 
 const redisConfig = {
-    url: "redis://localhost:6379",
-    database: 0
+    url: process.env.REDIS_URL || 'redis://localhost:6379',
+    database: Number(process.env.REDIS_DATABASE) || 0
 }
+
+// NetHunt statuses meaning the cached record no longer exists
+const STALE_RECORD_STATUSES = [404, 410];
 
 const redisClient = await createRedisClient(redisConfig)
     .on('error', (err) => console.log('Redis Client Error', err))
     .on('connect', () => console.log('Connected to Redis'))
     .connect();
+
+const connectClickHouse = (url) => {
+    clickhouseClient = createClient({
+        url,
+        username: dbServer.user,
+        password: dbServer.password,
+        database: dbServer.database
+    });
+    // Test connection
+    return clickhouseClient.query({query: 'SELECT 1'});
+};
+
+const connectDirectly = async () => {
+    const url = `http://${dbServer.host}:${dbServer.port}`;
+    await connectClickHouse(url);
+    console.log(`SSH tunnel skipped, ClickHouse used directly on ${url}`);
+};
 
 const setupSSHTunnel = () => new Promise((resolve, reject) => {
     sshClient.on('ready', () => {
@@ -102,19 +142,11 @@ const setupSSHTunnel = () => new Promise((resolve, reject) => {
             if (err) return reject(err);
             console.log(`SSH tunnel ready on ${forwardConfig.srcHost}:${forwardConfig.srcPort}`);
 
-            clickhouseClient = createClient({
-                url: `http://${forwardConfig.srcHost}:${forwardConfig.srcPort}`,
-                username: dbServer.user,
-                password: dbServer.password,
-                database: dbServer.database
-            });
-
-            // Test connection
-            clickhouseClient.query({query: 'SELECT 1'})
+            connectClickHouse(`http://${forwardConfig.srcHost}:${forwardConfig.srcPort}`)
                 .then(() => resolve())
                 .catch(reject);
         });
-    }).on('error', reject).connect(tunnelConfig);
+    }).on('error', reject).connect(buildTunnelConfig());
 });
 
 const authenticate = (req, res, next) => {
@@ -154,7 +186,7 @@ app.get('/sync', authenticate, async (req, res) => {
     }
 });
 
-setupSSHTunnel()
+(skipSSHTunnel ? connectDirectly() : setupSSHTunnel())
     .then(() => {
         app.listen(PORT, () => {
             console.log(`Server running on http://localhost:${PORT}`);
@@ -166,6 +198,7 @@ setupSSHTunnel()
     });
 
 sshClient.on('close', () => {
+    if (skipSSHTunnel) return;
     console.log('SSH connection closed. Reconnecting...');
     setupSSHTunnel().catch(console.error);
 });
@@ -174,6 +207,7 @@ process.on('SIGINT', async () => {
     console.log('\nGracefully shutting down...');
     try {
         await clickhouseClient?.close();
+        await redisClient?.quit();
         console.log('Connections closed');
         process.exit(0);
     } catch (err) {
@@ -190,7 +224,16 @@ cron.schedule('0,30 * * * *', async () => {
 
 async function executeSync() {
     const start = performance.now();
-    const result = await syncRecords();
+    // a failed sync still reports: zeros plus the error, instead of blowing up here
+    let result = {totalSynced: 0, createdRecords: 0, updatedRecords: 0};
+    let error = null;
+    try {
+        result = await syncRecords();
+    } catch (err) {
+        error = err;
+        console.error('Sync error:', err);
+    }
+
     const duration = performance.now() - start;
     console.log(`Duration: ${(duration / 1000).toFixed(2)} seconds`);
 
@@ -199,9 +242,14 @@ async function executeSync() {
         totalSynced: result.totalSynced,
         duration: duration,
         createdRecords: result.createdRecords,
-        updatedRecords: result.updatedRecords
+        updatedRecords: result.updatedRecords,
+        errorMessage: error ? error.message : null
     }
     await sendMetrics(syncData);
+
+    // metrics are written either way, but the caller still learns it failed
+    if (error) throw error;
+    return syncData;
 }
 
 async function syncRecords() {
@@ -213,7 +261,8 @@ async function syncRecords() {
     try {
         console.log('Starting sync...');
 
-        const {finishedAt} = await getLastSyncTime();
+        // the utils folder is empty until the first run ever writes metrics into it
+        const {finishedAt} = await getLastSyncTime() ?? {};
         const interval = calculateInterval(finishedAt);
         while (true) {
             const records = await fetchRecordsBatch(offset, interval);
@@ -243,7 +292,7 @@ async function syncRecords() {
 
 async function getLastSyncTime() {
     const response = await axios.get(
-        `https://nethunt.com/api/v1/zapier/triggers/new-record/${process.env.NETHUNT_UTILS_FOLDER_ID}`,
+        `${netHuntBaseUrl}/triggers/new-record/${process.env.NETHUNT_UTILS_FOLDER_ID}`,
         {
             auth: {
                 username: process.env.NETHUNT_USER,
@@ -265,7 +314,7 @@ function calculateInterval(lastSyncTime) {
 
     const diffMs = now.getTime() - lastSync.getTime();
     const diffMinutes = Math.ceil(diffMs / (1000 * 60));
-    console.info(`Last sync time detected: ${lastSyncTime}. Interval in minutes: ${diffMinutes}`)
+    console.info(`Last sync time detected: ${lastSyncTime}. Interval in minutes: ${diffMinutes}`);
 
     return Math.max(diffMinutes, DEFAULT_INTERVAL);
 }
@@ -273,7 +322,7 @@ function calculateInterval(lastSyncTime) {
 async function sendMetrics(data) {
     try {
         const response = await axios.post(
-            `https://nethunt.com/api/v1/zapier/actions/create-record/${process.env.NETHUNT_UTILS_FOLDER_ID}`,
+            `${netHuntBaseUrl}/actions/create-record/${process.env.NETHUNT_UTILS_FOLDER_ID}`,
             {
                 fields: data,
                 timeZone: "Europe/Warsaw"
@@ -292,17 +341,14 @@ async function sendMetrics(data) {
 }
 
 async function fetchRecordsBatch(offset, interval) {
-    try {
-        const result = await clickhouseClient.query({
-            query: clickHouseQuery,
-            format: 'JSONEachRow',
-            query_params: {batchSize: appConfig.batchSize, offset: offset, interval: interval}
-        });
-        return await result.json();
-    } catch (err) {
-        console.error('Error fetching records:', err);
-        return [];
-    }
+    // errors propagate on purpose: an empty array here would end the loop and
+    // report the sync as successful
+    const result = await clickhouseClient.query({
+        query: clickHouseQuery,
+        format: 'JSONEachRow',
+        query_params: {batchSize: appConfig.batchSize, offset: offset, interval: interval}
+    });
+    return await result.json();
 }
 
 async function processChunk(chunk) {
@@ -329,19 +375,25 @@ async function processRecord(record) {
     try {
         const cachedNetHuntUserId = await redisClient.get(record.FundistUserID);
         if (cachedNetHuntUserId) {
-            await updateNetHuntRecord(cachedNetHuntUserId, record);
-            return {action: 'updated'};
+            try {
+                await updateNetHuntRecord(cachedNetHuntUserId, record);
+                return {action: 'updated'};
+            } catch (err) {
+                if (!isRecordGone(err)) throw err;
+                console.warn(`Stale cache for ${record.FundistUserID}: NetHunt record ${cachedNetHuntUserId} is gone, re-resolving`);
+                await redisClient.del(record.FundistUserID);
+            }
         }
 
         const [existing] = await searchNetHuntRecord(record.FundistUserID);
         if (existing) {
             await updateNetHuntRecord(existing.id, record);
-            await redisClient.set(record.FundistUserID, existing.id);
+            await cacheRecordId(record.FundistUserID, existing.id);
             return {action: 'updated'};
         }
 
         const {recordId} = await createNetHuntRecord(record);
-        await redisClient.set(record.FundistUserID, recordId);
+        await cacheRecordId(record.FundistUserID, recordId);
         return {action: 'created'};
     } catch (err) {
         console.error(`Error processing ${record.FundistUserID}:`, {
@@ -352,6 +404,18 @@ async function processRecord(record) {
     }
 }
 
+function isRecordGone(err) {
+    return STALE_RECORD_STATUSES.includes(err.response?.status);
+}
+
+async function cacheRecordId(fundistUserId, recordId) {
+    if (!recordId) {
+        console.warn(`No record id to cache for ${fundistUserId}`);
+        return;
+    }
+    await redisClient.set(fundistUserId, recordId, {EX: appConfig.cacheTtlSeconds});
+}
+
 // NetHunt API Helpers
 async function searchNetHuntRecord(userId) {
     const controller = new AbortController();
@@ -359,7 +423,7 @@ async function searchNetHuntRecord(userId) {
 
     try {
         const response = await axios.get(
-            `https://nethunt.com/api/v1/zapier/searches/find-record/${process.env.NETHUNT_FOLDER_ID}`,
+            `${netHuntBaseUrl}/searches/find-record/${process.env.NETHUNT_FOLDER_ID}`,
             {
                 params: {query: `FundistUserID=${userId}`},
                 auth: {
@@ -381,7 +445,7 @@ async function createNetHuntRecord(record) {
 
     try {
         const response = await axios.post(
-            `https://nethunt.com/api/v1/zapier/actions/create-record/${process.env.NETHUNT_FOLDER_ID}`,
+            `${netHuntBaseUrl}/actions/create-record/${process.env.NETHUNT_FOLDER_ID}`,
             {
                 fields: mapRecordFields(record),
                 timeZone: "Europe/Warsaw"
@@ -406,7 +470,7 @@ async function updateNetHuntRecord(recordId, data) {
 
     try {
         const response = await axios.post(
-            `https://nethunt.com/api/v1/zapier/actions/update-record/${recordId}`,
+            `${netHuntBaseUrl}/actions/update-record/${recordId}`,
             {
                 fieldActions: mapRecordFieldsForUpdate(data)
             },

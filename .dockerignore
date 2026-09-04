@@ -1,0 +1,22 @@
+node_modules
+npm-debug.log
+
+.git
+.gitignore
+.idea
+.claude
+.DS_Store
+
+# local development contour never ships
+dev/
+docker-compose.dev.yml
+.env.dev
+
+# secrets come from Dokploy env vars, never from the image
+.env
+*.pem
+id_ed25519*
+
+*.MD
+*.md
+LICENSE

@@ -1,0 +1,56 @@
+# Production stack, deployed by Dokploy (Compose type).
+#
+# Environment comes from Dokploy, not from a file in the repo. Required there:
+#   CLICKHOUSE_HOST/PORT/USER/PASSWORD/DATABASE
+#   SSH_HOST/SSH_PORT/SSH_USER  + SSH_PRIVATE_KEY_B64
+#   NETHUNT_USER/NETHUNT_API_KEY/NETHUNT_FOLDER_ID/NETHUNT_UTILS_FOLDER_ID
+#
+# Generate the key value with:  base64 -i ~/.ssh/id_ed25519 | tr -d '\n'
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      # Redis is a sibling container, not localhost
+      REDIS_URL: redis://redis:6379
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE}
+      SSH_HOST: ${SSH_HOST}
+      SSH_PORT: ${SSH_PORT}
+      SSH_USER: ${SSH_USER}
+      SSH_PRIVATE_KEY_B64: ${SSH_PRIVATE_KEY_B64}
+      NETHUNT_USER: ${NETHUNT_USER}
+      NETHUNT_API_KEY: ${NETHUNT_API_KEY}
+      NETHUNT_FOLDER_ID: ${NETHUNT_FOLDER_ID}
+      NETHUNT_UTILS_FOLDER_ID: ${NETHUNT_UTILS_FOLDER_ID}
+      BATCH_SIZE: ${BATCH_SIZE:-100}
+      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-5}
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-60}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-1209600}
+    expose:
+      - "3000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # the id cache must survive a restart: without it the next sync falls back
+    # to a search call per record
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:

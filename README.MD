@@ -55,3 +55,111 @@ The service will:
 2. Sync data every 60 minutes
 3. Provide status at http://localhost:3000
 4. Run sync manually at http://localhost:3000/sync use NetHunt API key with Bearer auth
+
+## Local development
+
+The whole contour runs locally, so no ClickHouse credentials, no bastion access
+and no NetHunt API key are needed to work on the sync.
+
+```bash
+# 1. Start ClickHouse (seeded), Redis and a NetHunt API mock
+npm run dev:up
+
+# 2. Run the service against them (.env.dev, no secrets in it)
+npm run dev
+
+# 3. Trigger a sync
+curl http://localhost:3001/sync -H "Authorization: Bearer dev-key"
+
+# Stop and wipe
+npm run dev:down
+```
+
+`SKIP_SSH_TUNNEL=1` makes the service talk to ClickHouse directly instead of
+opening a bastion tunnel; `NETHUNT_BASE_URL` points the CRM calls at the mock.
+Both default to production behaviour when unset.
+
+The seed anchors `LastUpdated` to `now()`, so data seeded yesterday falls
+outside the sync window today and the service correctly reports 0 records.
+`npm run dev:reseed` refreshes the timestamps without recreating the contour.
+
+### Seed data
+
+`dev/clickhouse/init/` creates the three tables the sync query reads and fills
+them with 250 users x 3 revisions. The shape is deliberate:
+
+- older revisions carry `STALE-*` values, so a broken `argMax(..., RecordTime)`
+  shows up immediately in what reaches the CRM
+- 180 users fall inside the default 60-minute window, 70 outside it, which
+  proves the `LastUpdated` filter is doing something
+- 180 matching users against `BATCH_SIZE=100` makes pagination run twice
+
+### NetHunt mock
+
+`dev/nethunt-mock/` implements the four endpoints the service calls, keeps
+records in memory, and adds an admin surface the real API does not have:
+
+```bash
+# what the CRM currently holds
+curl http://localhost:3010/__admin/state
+
+# delete a record behind the service's back, to exercise cache invalidation
+curl -X DELETE http://localhost:3010/__admin/records/rec_1
+
+# forget everything
+curl -X POST http://localhost:3010/__admin/reset
+```
+
+Deleting a record is the interesting one: the next sync finds a stale id in
+Redis, gets a 404, drops the key and re-creates the record in the same run.
+
+## Deployment (Dokploy)
+
+The stack is deployed as a Dokploy **Compose** application from
+[docker-compose.yml](docker-compose.yml): the service plus its own Redis.
+
+1. Create a Compose application in Dokploy pointing at this repository.
+2. Fill in the environment (Dokploy injects it into the compose file):
+
+   ```
+   CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER,
+   CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE
+   SSH_HOST, SSH_PORT, SSH_USER, SSH_PRIVATE_KEY_B64
+   NETHUNT_USER, NETHUNT_API_KEY,
+   NETHUNT_FOLDER_ID, NETHUNT_UTILS_FOLDER_ID
+   ```
+
+   `REDIS_URL` is set in the compose file and must not be overridden.
+
+3. Deploy. `GET /` on port 3000 is the health endpoint.
+
+### The SSH key
+
+A container has no key file to point `SSH_KEY_PATH` at, so the key is passed
+as a value instead:
+
+```bash
+base64 -i ~/.ssh/id_ed25519 | tr -d '\n'
+```
+
+Base64 rather than the raw PEM because env editors mangle the newlines the key
+needs. The service falls back to `SSH_PRIVATE_KEY` (raw) and then to
+`SSH_KEY_PATH`, so bare-metal runs keep working unchanged.
+
+Note that an env var is readable by anyone with access to the Dokploy UI or
+API. If that is too broad, mount the key as a file instead and keep using
+`SSH_KEY_PATH`.
+
+### What to whitelist
+
+ClickHouse only ever sees connections from the **bastion**, never from Dokploy
+or from a developer machine -- the tunnel forwards to it from inside the
+bastion's network. So the ClickHouse whitelist needs the bastion's static IP,
+once. What Dokploy needs is SSH access to that bastion.
+
+### Redis persistence
+
+Redis runs with `--appendonly yes` on a named volume. This matters: the cache
+maps FundistUserID to NetHunt record id, and losing it makes the next sync
+issue one extra search request per record.
+

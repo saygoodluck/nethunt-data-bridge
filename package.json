@@ -7,7 +7,12 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "DOTENV_CONFIG_PATH=.env.dev node index.js",
+    "dev:up": "docker compose -f docker-compose.dev.yml up -d --wait",
+    "dev:down": "docker compose -f docker-compose.dev.yml down -v",
+    "dev:logs": "docker compose -f docker-compose.dev.yml logs -f",
+    "dev:reseed": "./dev/reseed.sh"
   },
   "dependencies": {
     "@clickhouse/client": "^1.10.1",
