@@ -113,6 +113,64 @@ curl -X POST http://localhost:3010/__admin/reset
 Deleting a record is the interesting one: the next sync finds a stale id in
 Redis, gets a 404, drops the key and re-creates the record in the same run.
 
+## Telegram bot
+
+Optional. With no `TELEGRAM_BOT_TOKEN` the module is inert and the service runs
+exactly as it did before.
+
+```
+TELEGRAM_BOT_TOKEN=...      # from @BotFather
+TELEGRAM_CHAT_ID=...        # chat that gets notifications and may send commands
+TELEGRAM_ADMINS=...         # optional extra user ids, comma separated
+DAILY_REPORT_AT=09:00       # empty disables the summary
+```
+
+### What it sends, and what it deliberately does not
+
+The sync runs 48 times a day. A message per run would train you to ignore the
+chat, so notifications follow **state changes** instead:
+
+| Event | Message |
+|---|---|
+| First failure | one alert with the error |
+| Failures 2..n | nothing |
+| First success after a failure | one recovery notice |
+| Successful sync | nothing (set `NOTIFY_EACH_SYNC=1` to change this) |
+| `DAILY_REPORT_AT` | one summary of the previous day |
+
+So a broken sync costs two messages in total -- one when it breaks, one when it
+comes back -- however long it stays broken.
+
+### Commands
+
+Accepted from `TELEGRAM_CHAT_ID`, or from any user id in `TELEGRAM_ADMINS`.
+Anything else is logged and ignored.
+
+- `/status` — uptime, ClickHouse and Redis health, cached ids, last sync
+- `/last` — details of the most recent sync
+- `/report` — yesterday's summary on demand
+- `/sync` — run a sync now
+
+### Daily counters
+
+Per-day totals live in Redis under `stats:YYYY-MM-DD` with a three-day TTL, so
+the summary survives a restart or a redeploy. That is also why `/status` counts
+those keys alongside the cached ids.
+
+### Testing it locally
+
+The dev mock also stands in for the Bot API, so all of this can be exercised
+without a real token:
+
+```bash
+# see what the service has sent
+curl http://localhost:3010/__admin/telegram/messages
+
+# pretend a user typed a command
+curl -X POST http://localhost:3010/__admin/telegram/send-command \
+     -H 'Content-Type: application/json' -d '{"text":"/status"}'
+```
+
 ## Deployment (Dokploy)
 
 The stack is deployed as a Dokploy **Compose** application from

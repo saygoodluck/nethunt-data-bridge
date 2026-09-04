@@ -55,6 +55,12 @@ const applyFieldActions = (fields, fieldActions) => {
     return fields;
 };
 
+// --- Telegram Bot API stand-in ---------------------------------------------
+// Lets the notification logic be exercised without a real bot token.
+const sentMessages = [];
+let pendingUpdates = [];
+let updateId = 1;
+
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const path = url.pathname;
@@ -83,6 +89,42 @@ const server = http.createServer(async (req, res) => {
             nextId = 1;
             console.log('[admin] state reset');
             return json(res, 200, {ok: true});
+        }
+
+        if (path === '/__admin/telegram/messages' && method === 'GET') {
+            return json(res, 200, sentMessages);
+        }
+
+        // queue a command as if a user had typed it in the chat
+        if (path === '/__admin/telegram/send-command' && method === 'POST') {
+            const body = await readBody(req);
+            pendingUpdates.push({
+                update_id: updateId++,
+                message: {
+                    text: body.text,
+                    chat: {id: Number(body.chatId ?? 12345)},
+                    from: {id: Number(body.fromId ?? 999)}
+                }
+            });
+            return json(res, 200, {queued: body.text});
+        }
+
+        // --- telegram bot api ------------------------------------------------
+        const tg = /^\/bot[^/]+\/(\w+)$/.exec(path);
+        if (tg && method === 'POST') {
+            const body = await readBody(req);
+            if (tg[1] === 'sendMessage') {
+                sentMessages.push({chat_id: body.chat_id, text: body.text});
+                console.log(`[telegram] ${String(body.text).split('\n')[0]}`);
+                return json(res, 200, {ok: true, result: {message_id: sentMessages.length}});
+            }
+            if (tg[1] === 'getUpdates') {
+                const result = pendingUpdates;
+                pendingUpdates = [];
+                // answer immediately rather than long-polling
+                return json(res, 200, {ok: true, result});
+            }
+            return json(res, 200, {ok: true, result: {}});
         }
 
         // --- zapier api ------------------------------------------------------

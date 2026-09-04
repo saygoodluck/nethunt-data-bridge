@@ -5,6 +5,8 @@ import express from 'express';
 import cron from 'node-cron';
 import axios from 'axios';
 
+import {createTelegramBot} from './telegram.js';
+
 import fs from 'fs';
 import net from 'net';
 import {performance} from 'node:perf_hooks';
@@ -116,6 +118,34 @@ const connectDirectly = async () => {
     console.log(`SSH tunnel skipped, ClickHouse used directly on ${url}`);
 };
 
+const formatUptime = (seconds) => {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    return h ? `${h}h ${m}m` : `${m}m`;
+};
+
+const telegramBot = createTelegramBot({
+    redisClient,
+    // executeSync is hoisted; the bot only calls it once a command arrives
+    runSync: () => executeSync(),
+    getStatus: async () => {
+        const check = async (probe) => {
+            try {
+                await probe();
+                return 'ok';
+            } catch (err) {
+                return `error: ${err.message}`;
+            }
+        };
+        return {
+            uptime: formatUptime(process.uptime()),
+            clickhouse: await check(() => clickhouseClient.query({query: 'SELECT 1'})),
+            redis: await check(() => redisClient.ping()),
+            cachedIds: await redisClient.dbSize().catch(() => 'unknown')
+        };
+    }
+});
+
 const setupSSHTunnel = () => new Promise((resolve, reject) => {
     sshClient.on('ready', () => {
         if (tunnelServer) {
@@ -191,6 +221,8 @@ app.get('/sync', authenticate, async (req, res) => {
         app.listen(PORT, () => {
             console.log(`Server running on http://localhost:${PORT}`);
         });
+        telegramBot.startPolling();
+        telegramBot.notifyStartup().catch(console.error);
     })
     .catch(err => {
         console.error('Initialization failed:', err);
@@ -206,6 +238,7 @@ sshClient.on('close', () => {
 process.on('SIGINT', async () => {
     console.log('\nGracefully shutting down...');
     try {
+        telegramBot.stop();
         await clickhouseClient?.close();
         await redisClient?.quit();
         console.log('Connections closed');
@@ -221,6 +254,14 @@ cron.schedule('0,30 * * * *', async () => {
     console.log(`${new Date()} | Running scheduled task...`);
     await executeSync().catch(console.error);
 });
+
+if (telegramBot.enabled && telegramBot.dailyReportAt) {
+    const [hour, minute] = telegramBot.dailyReportAt.split(':');
+    cron.schedule(`${Number(minute)} ${Number(hour)} * * *`, () => {
+        telegramBot.sendDailyReport().catch(console.error);
+    });
+    console.log(`Daily Telegram report scheduled at ${telegramBot.dailyReportAt}`);
+}
 
 async function executeSync() {
     const start = performance.now();
@@ -246,6 +287,7 @@ async function executeSync() {
         errorMessage: error ? error.message : null
     }
     await sendMetrics(syncData);
+    await telegramBot.notifySyncResult(syncData);
 
     // metrics are written either way, but the caller still learns it failed
     if (error) throw error;

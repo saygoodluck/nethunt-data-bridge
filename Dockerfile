@@ -6,7 +6,7 @@ WORKDIR /app
 COPY --chown=node:node package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY --chown=node:node index.js ./
+COPY --chown=node:node index.js telegram.js ./
 
 # the SSH tunnel and the CRM calls are outbound only; nothing is written to disk
 USER node
