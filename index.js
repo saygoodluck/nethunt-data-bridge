@@ -9,6 +9,8 @@ import {createTelegramBot} from './telegram.js';
 
 import fs from 'fs';
 import net from 'net';
+import os from 'node:os';
+import path from 'node:path';
 import {performance} from 'node:perf_hooks';
 
 import 'dotenv/config';
@@ -61,7 +63,13 @@ const readPrivateKey = () => {
     if (process.env.SSH_PRIVATE_KEY) {
         return process.env.SSH_PRIVATE_KEY;
     }
-    return fs.readFileSync(process.env.SSH_KEY_PATH || './id_ed25519');
+    const keyPath = process.env.SSH_KEY_PATH || './id_ed25519';
+    // ssh expands a leading ~ itself, Node does not: a path that works in a
+    // shell check would fail here with ENOENT
+    const resolved = keyPath.startsWith('~/')
+        ? path.join(os.homedir(), keyPath.slice(2))
+        : keyPath;
+    return fs.readFileSync(resolved);
 };
 
 const buildTunnelConfig = () => ({

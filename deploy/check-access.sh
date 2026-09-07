@@ -55,6 +55,12 @@ step "SSH to bastion ($SSH_USER@$SSH_HOST:$SSH_PORT)"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -p "$SSH_PORT")
 
 if [[ -n "${SSH_KEY_PATH:-}" ]]; then
+    # ssh expands a leading ~ but Node's readFileSync does not, so a value that
+    # passes this check would still break the service at runtime
+    if [[ "$SSH_KEY_PATH" == "~/"* ]]; then
+        red "   SSH_KEY_PATH starts with ~; use an absolute path such as $HOME/.ssh/id_ed25519"
+        SSH_KEY_PATH="${HOME}/${SSH_KEY_PATH#\~/}"
+    fi
     if [[ ! -r "$SSH_KEY_PATH" ]]; then
         bad "SSH_KEY_PATH points at $SSH_KEY_PATH, which does not exist here"
         if [[ "$SSH_KEY_PATH" == /Users/* ]]; then
