@@ -53,13 +53,39 @@ ok "all required variables present"
 # --- 1. can we reach the bastion at all? ------------------------------------
 step "SSH to bastion ($SSH_USER@$SSH_HOST:$SSH_PORT)"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -p "$SSH_PORT")
-[[ -n "${SSH_KEY_PATH:-}" ]] && SSH_OPTS+=(-i "$SSH_KEY_PATH")
+
+if [[ -n "${SSH_KEY_PATH:-}" ]]; then
+    if [[ ! -r "$SSH_KEY_PATH" ]]; then
+        bad "SSH_KEY_PATH points at $SSH_KEY_PATH, which does not exist here"
+        if [[ "$SSH_KEY_PATH" == /Users/* ]]; then
+            red "   That is a macOS path -- this .env was copied from a laptop."
+        fi
+        red "   Keys available to $(whoami):"
+        ls -1 "$HOME"/.ssh/id_* 2>/dev/null | grep -v '\.pub$' | sed 's/^/     /' \
+            || red "     none -- generate one with: ssh-keygen -t ed25519"
+        red "   Set SSH_KEY_PATH to the private key whose .pub was given to the admins."
+        exit 1
+    fi
+    # without this ssh silently falls back to other keys and the error is ambiguous
+    SSH_OPTS+=(-i "$SSH_KEY_PATH" -o IdentitiesOnly=yes)
+    ok "using key $SSH_KEY_PATH ($(ssh-keygen -lf "$SSH_KEY_PATH" 2>/dev/null | awk '{print $2}'))"
+else
+    red "   SSH_KEY_PATH is not set; relying on whatever ssh picks by default"
+fi
 
 if ssh_out=$(ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" 'echo reachable; hostname' 2>&1); then
     ok "authenticated as $SSH_USER ($(echo "$ssh_out" | tail -1))"
 else
     bad "$(echo "$ssh_out" | tail -3)"
-    red "   The key is not accepted, or this IP is not allowed to connect."
+    if [[ "$ssh_out" == *"Permission denied"* ]]; then
+        red "   The server reached the bastion, so the address and port are fine."
+        red "   Either the admins have not installed this key yet, or it was"
+        red "   installed for a different user than '$SSH_USER'."
+        if [[ -n "${SSH_KEY_PATH:-}" && -r "${SSH_KEY_PATH}.pub" ]]; then
+            red "   The public key to hand them is:"
+            sed 's/^/     /' "${SSH_KEY_PATH}.pub"
+        fi
+    fi
     exit 1
 fi
 
