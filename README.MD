@@ -191,6 +191,26 @@ The stack is deployed as a Dokploy **Compose** application from
 
 3. Deploy. `GET /` on port 3000 is the health endpoint.
 
+### Verifying access before deploying
+
+`deploy/check-access.sh` walks the layers between the host and the data one at
+a time -- SSH to the bastion, the tunnel, ClickHouse credentials, the schema,
+the sync query, and the NetHunt endpoints -- so a failure names the layer that
+broke instead of surfacing later as "the sync does not work".
+
+```bash
+./deploy/check-access.sh          # reads ./.env
+./deploy/check-access.sh /path/to/.env
+```
+
+Run it **on the whitelisted server**. From a laptop it fails at the ClickHouse
+step regardless of how correct the credentials are, because the whitelist is
+keyed on the server's address.
+
+It is read-only: nothing is written to ClickHouse and no NetHunt record is
+created. It also lists any birth-like column in `UserHistory`, which is what
+the unmapped `DateOfBirth` field needs (see below).
+
 ### The SSH key
 
 A container has no key file to point `SSH_KEY_PATH` at, so the key is passed
