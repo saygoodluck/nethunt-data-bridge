@@ -29,7 +29,15 @@ SELECT
     toUInt8(if(UserID % 7 = 0, 0, 1))                       AS Status,
     now() - INTERVAL (2 - toUInt32(number % 3)) DAY         AS RecordTime,
     -- users 1..180 are "recently changed", the rest must be filtered out
-    if(UserID <= 180, now() - INTERVAL toUInt32(UserID % 30) MINUTE, now() - INTERVAL 5 DAY) AS LastUpdated
+    if(UserID <= 180, now() - INTERVAL toUInt32(UserID % 30) MINUTE, now() - INTERVAL 5 DAY) AS LastUpdated,
+    -- every branch of the DateOfBirth expression gets a case here:
+    --   UserID % 4 != 0            -> Date32 carries the real value
+    --   UserID % 8 = 0             -> Date32 is the placeholder, string has the value
+    --   UserID % 4 = 0 (not % 8)   -> both empty
+    if(UserID % 8 = 0, concat('19', toString(70 + UserID % 30), '-03-21'), NULL) AS DateOfBirth,
+    if(UserID % 4 = 0,
+       toDate32('1900-01-01'),
+       toDate32(concat('19', toString(60 + UserID % 40), '-0', toString(1 + UserID % 9), '-1', toString(UserID % 10)))) AS DateOfBirthNew
 FROM numbers(750);
 
 -- Two turnover rows per user: the query sums them, so the totals prove the GROUP BY

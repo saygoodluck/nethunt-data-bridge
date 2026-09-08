@@ -86,3 +86,7 @@ yarn-error.log
 # Sensitive data
 id_ed25519
 id_rsa
+
+# scripts live in deploy/; a copy landing at the root is an accident
+/inspect-db.sh
+/check-access.sh

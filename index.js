@@ -723,6 +723,13 @@ const clickHouseQuery = `
            argMax(uh.Email, uh.RecordTime) as Email,
            argMax(uh.Phone, uh.RecordTime) as PhoneNumber,
            if(argMax(uh.PhoneVerified, uh.RecordTime) = 1, 'Verified', 'Unverified') as PhoneVerified,
+           -- DateOfBirthNew is the current Date32 column and uses 1900-01-01 as
+           -- "unknown"; the older Nullable(String) column still holds a real date
+           -- for some users, so it is the fallback. Column names stay qualified:
+           -- an unqualified one would resolve to this alias and nest the argMax.
+           if(argMax(uh.DateOfBirthNew, uh.RecordTime) != toDate32('1900-01-01'),
+              toString(argMax(uh.DateOfBirthNew, uh.RecordTime)),
+              ifNull(argMax(uh.DateOfBirth, uh.RecordTime), '')) AS DateOfBirth,
            argMax(uh.Gender, uh.RecordTime) AS Gender,
            argMax(uh.Language, uh.RecordTime) AS Language,
            argMax(c.Name, uh.RecordTime) AS Country,

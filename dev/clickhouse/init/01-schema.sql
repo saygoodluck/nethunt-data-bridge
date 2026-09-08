@@ -26,7 +26,12 @@ CREATE TABLE IF NOT EXISTS analytics.UserHistory
     -- argMax(..., RecordTime) picks the newest revision of every field
     RecordTime       DateTime,
     -- the sync window filters on this
-    LastUpdated      DateTime
+    LastUpdated      DateTime,
+    -- two generations of the same field, as in production: the Date32 column is
+    -- authoritative but stores 1900-01-01 for "unknown", and the older string
+    -- column still holds a real value for some users
+    DateOfBirth      Nullable(String),
+    DateOfBirthNew   Date32
 )
 ENGINE = MergeTree
 ORDER BY (UserID, RecordTime);
