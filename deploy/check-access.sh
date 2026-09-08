@@ -36,6 +36,11 @@ if [[ ! -f "$ENV_FILE" ]]; then
     red "No env file at $ENV_FILE"
     exit 1
 fi
+if grep -q $'\r' "$ENV_FILE"; then
+    bad "$ENV_FILE has Windows line endings; every value ends with a stray CR"
+    red "   Fix with: sed -i 's/\r$//' $ENV_FILE"
+    exit 1
+fi
 set -a; . "$ENV_FILE"; set +a
 ok "loaded $ENV_FILE"
 
@@ -227,18 +232,38 @@ if [[ -n "${NETHUNT_API_KEY:-}" && -n "${NETHUNT_USER:-}" ]]; then
     step "NetHunt API"
     base="${NETHUNT_BASE_URL:-https://nethunt.com/api/v1/zapier}"
 
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-        -u "${NETHUNT_USER}:${NETHUNT_API_KEY}" \
-        "${base}/searches/find-record/${NETHUNT_FOLDER_ID}?query=FundistUserID=0")
-    [[ "$code" == "200" ]] && ok "records folder reachable (HTTP $code)" \
-                           || bad "records folder returned HTTP $code"
+    nethunt_call() {
+        local label="$1" url="$2" body code
+        body=$(curl -s -w '\n%{http_code}' --max-time 20 \
+            -u "${NETHUNT_USER}:${NETHUNT_API_KEY}" "$url")
+        code=$(tail -1 <<< "$body")
+        body=$(sed '$d' <<< "$body")
+
+        if [[ "$code" == "200" ]]; then
+            ok "$label reachable (HTTP $code)"
+            return 0
+        fi
+
+        bad "$label returned HTTP $code"
+        # the API usually explains itself; a bare status code does not
+        [[ -n "$body" ]] && red "   response: $(head -c 300 <<< "$body")"
+        if [[ "$code" == "401" ]]; then
+            red "   Basic auth was rejected. NETHUNT_USER must be the account"
+            red "   email and NETHUNT_API_KEY the key from NetHunt settings."
+            red "   user=${NETHUNT_USER} key length=${#NETHUNT_API_KEY}"
+            [[ "${NETHUNT_USER}" != *@* ]] && red "   NETHUNT_USER does not look like an email address."
+            [[ "${NETHUNT_API_KEY}" =~ [[:space:]] ]] && red "   NETHUNT_API_KEY contains whitespace."
+        elif [[ "$code" == "404" ]]; then
+            red "   Authenticated, but that folder id does not exist."
+        fi
+        return 1
+    }
+
+    nethunt_call "records folder" \
+        "${base}/searches/find-record/${NETHUNT_FOLDER_ID}?query=FundistUserID=0"
 
     if [[ -n "${NETHUNT_UTILS_FOLDER_ID:-}" ]]; then
-        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-            -u "${NETHUNT_USER}:${NETHUNT_API_KEY}" \
-            "${base}/triggers/new-record/${NETHUNT_UTILS_FOLDER_ID}")
-        [[ "$code" == "200" ]] && ok "utils folder reachable (HTTP $code)" \
-                               || bad "utils folder returned HTTP $code"
+        nethunt_call "utils folder" "${base}/triggers/new-record/${NETHUNT_UTILS_FOLDER_ID}"
     else
         red "   NETHUNT_UTILS_FOLDER_ID is not set; metrics and last-sync time will not work"
     fi

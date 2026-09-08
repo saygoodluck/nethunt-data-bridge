@@ -737,7 +737,19 @@ const clickHouseQuery = `
            any(t.TotalWithdraw) as TotalWithdraw
     FROM UserHistory uh
              JOIN CountriesNew c ON c.ID = uh.CountryID
-             LEFT JOIN (SELECT UserID, sum(Deposit) / 100 AS TotalDeposit, sum(Withdraw) / 100 AS TotalWithdraw FROM Turnovers t GROUP BY UserID) t ON uh.UserID = t.UserID
+             LEFT JOIN (SELECT UserID,
+                               sum(Deposit) / 100  AS TotalDeposit,
+                               sum(Withdraw) / 100 AS TotalWithdraw
+                        FROM Turnovers
+                        -- Without this the whole table is aggregated on every
+                        -- page, since ClickHouse does not push the outer filter
+                        -- into a joined subquery. Only users in the sync window
+                        -- can appear in the result, so restricting it here
+                        -- changes nothing but the work done.
+                        WHERE UserID IN (SELECT UserID
+                                         FROM UserHistory
+                                         WHERE LastUpdated > now() - INTERVAL {interval: UInt32} MINUTE)
+                        GROUP BY UserID) t ON uh.UserID = t.UserID
     WHERE uh.LastUpdated > now() - INTERVAL {interval: UInt32} MINUTE
     GROUP BY uh.UserID
     ORDER BY uh.UserID DESC
