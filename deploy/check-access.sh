@@ -79,19 +79,39 @@ else
     red "   SSH_KEY_PATH is not set; relying on whatever ssh picks by default"
 fi
 
-# -v so authentication can be judged separately from the remote command:
-# accounts issued purely for port forwarding often refuse to run one, and that
-# must not be reported as a failed login
-ssh_out=$(ssh -v "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" 'echo reachable; hostname' 2>&1)
+# -v so authentication can be judged separately from the remote command, and a
+# hard timeout because ConnectTimeout only covers the TCP connect: a
+# forwarding-only account can authenticate and then never return a session,
+# leaving the check hanging with nothing printed.
+# -n keeps ssh from waiting on our stdin as well.
+run_ssh() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 20 ssh -v -n "$@"
+    else
+        ssh -v -n -o ConnectTimeout=10 "$@"
+    fi
+}
+
+ssh_out=$(run_ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" 'echo reachable; hostname' 2>&1)
 ssh_rc=$?
 
+# "Authenticated to" appears well before the session would hang, so it is
+# conclusive even when the command below never completes
 if grep -q "Authenticated to" <<< "$ssh_out"; then
     if [[ $ssh_rc -eq 0 ]]; then
-        ok "authenticated as $SSH_USER ($(grep -v '^debug' <<< "$ssh_out" | tail -1))"
+        ok "authenticated as $SSH_USER ($(grep -vE '^debug[0-9]?:' <<< "$ssh_out" | tail -1))"
+    elif [[ $ssh_rc -eq 124 ]]; then
+        ok "authenticated as $SSH_USER"
+        echo "   (the session never returned -- normal for a forwarding-only account;"
+        echo "    what matters is the tunnel, tested next)"
     else
         ok "authenticated as $SSH_USER"
         echo "   (remote commands are refused -- expected for a forwarding-only account)"
     fi
+elif [[ $ssh_rc -eq 124 ]]; then
+    bad "no response within 20s, and authentication was never confirmed"
+    red "   The host answers but the login does not complete."
+    exit 1
 else
     bad "$(grep -vE '^debug[0-9]?:' <<< "$ssh_out" | tail -3)"
     if [[ "$ssh_out" == *"Permission denied"* ]]; then
