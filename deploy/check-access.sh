@@ -79,10 +79,21 @@ else
     red "   SSH_KEY_PATH is not set; relying on whatever ssh picks by default"
 fi
 
-if ssh_out=$(ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" 'echo reachable; hostname' 2>&1); then
-    ok "authenticated as $SSH_USER ($(echo "$ssh_out" | tail -1))"
+# -v so authentication can be judged separately from the remote command:
+# accounts issued purely for port forwarding often refuse to run one, and that
+# must not be reported as a failed login
+ssh_out=$(ssh -v "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" 'echo reachable; hostname' 2>&1)
+ssh_rc=$?
+
+if grep -q "Authenticated to" <<< "$ssh_out"; then
+    if [[ $ssh_rc -eq 0 ]]; then
+        ok "authenticated as $SSH_USER ($(grep -v '^debug' <<< "$ssh_out" | tail -1))"
+    else
+        ok "authenticated as $SSH_USER"
+        echo "   (remote commands are refused -- expected for a forwarding-only account)"
+    fi
 else
-    bad "$(echo "$ssh_out" | tail -3)"
+    bad "$(grep -vE '^debug[0-9]?:' <<< "$ssh_out" | tail -3)"
     if [[ "$ssh_out" == *"Permission denied"* ]]; then
         red "   The server reached the bastion, so the address and port are fine."
         red "   Either the admins have not installed this key yet, or it was"
@@ -97,13 +108,18 @@ fi
 
 # --- 2. can the bastion see ClickHouse? -------------------------------------
 step "Tunnel to ClickHouse ($CLICKHOUSE_HOST:$CLICKHOUSE_PORT via bastion)"
-ssh "${SSH_OPTS[@]}" -N -L "${TUNNEL_PORT}:${CLICKHOUSE_HOST}:${CLICKHOUSE_PORT}" \
+# ExitOnForwardFailure: without it ssh stays up after a refused forward and the
+# tunnel looks established until the first request times out
+ssh "${SSH_OPTS[@]}" -o ExitOnForwardFailure=yes -N \
+    -L "${TUNNEL_PORT}:${CLICKHOUSE_HOST}:${CLICKHOUSE_PORT}" \
     "$SSH_USER@$SSH_HOST" &
 SSH_PID=$!
 sleep 3
 
 if ! kill -0 "$SSH_PID" 2>/dev/null; then
     bad "tunnel process died immediately"
+    red "   The account authenticates but port forwarding is not permitted,"
+    red "   or the bastion cannot open ${CLICKHOUSE_HOST}:${CLICKHOUSE_PORT}."
     exit 1
 fi
 ok "tunnel up on 127.0.0.1:$TUNNEL_PORT"
