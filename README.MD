@@ -173,77 +173,75 @@ curl -X POST http://localhost:3010/__admin/telegram/send-command \
 
 ## NetHunt setup
 
-### The API key
+The service uses the **v2 REST API** (`/api/v2/...`).
 
-NetHunt issues two kinds of key in two different places, and only one of them
-works here:
+### The token
 
-| Settings section | Key for |
+NetHunt issues two kinds of credential in two different settings sections:
+
+| Settings section | For |
 |---|---|
-| API & MCP | the v2 API |
-| Apps and other integrations → **API LEGACY** | the v1 API |
+| **API & MCP** | the v2 API — a Bearer token shaped `nh_live_...` |
+| Apps and other integrations → API LEGACY | the old v1 API |
 
-The service calls `/api/v1/zapier/...`, so it needs the **LEGACY** key. A v2 key
-is rejected with `Your email address or API key does not appear to be valid` —
-the same message you get for a typo, so this is worth checking first.
+v2 needs the first one, in `NETHUNT_API_TOKEN`. A legacy key is rejected with
+401. (Historically this bit the other way round, which is why both are spelled
+out here.)
 
-The basic-auth username is the account's email address.
+`SYNC_API_KEY` is a separate thing entirely: the bearer token for this service's
+own `/sync` endpoint.
 
 ### Folders
 
-Two folders are needed. Field names must match exactly: the payload is built
-from these keys, and records are looked up with `query=FundistUserID=<id>`.
+Two folders, with field names matching exactly — the payload is built from
+these names, resolved to field ids at startup.
 
-**Records folder** (`NETHUNT_FOLDER_ID`) — the 21 fields the sync owns, from
-`mapRecordFields()`. `Name` is created by NetHunt with every folder and is the
-record title shown in lists and cards; the sync fills it from the first and last
-name, falling back to the login, so records do not read as blank in the UI:
+**Records folder** (`NETHUNT_FOLDER_ID`) — the 20 fields the sync owns:
+`FundistUserID`, `TotalDeposit` and `TotalWithdraw` as **number**; everything
+else as text — `Login`, `FirstName`, `LastName`, `Email`, `PhoneNumber`,
+`PhoneVerified`, `DateOfBirth`, `Gender`, `Language`, `Country`, `City`,
+`Timezone`, `LastCreditDate`, `RegistrationDate`, `LastLoginDate`, `PEP`,
+`AccountStatus`.
 
-`Name` as Text, `FundistUserID` and `TotalDeposit`/`TotalWithdraw` as Number, `Email` as Email,
-`PhoneNumber` as Phone, everything else as Text — `Login`, `FirstName`,
-`LastName`, `PhoneVerified`, `DateOfBirth`, `Gender`, `Language`, `Country`,
-`City`, `Timezone`, `LastCreditDate`, `RegistrationDate`, `LastLoginDate`,
-`PEP`, `AccountStatus`.
+Dates are sent as `YYYY-MM-DD HH:MM:SS` strings, so those fields must be text.
+A real date field expects epoch milliseconds and would reject every write; the
+service refuses to start if it finds one, rather than failing per record.
 
-Dates arrive as `YYYY-MM-DD HH:MM:SS` strings and the fields with a fixed set of
-values can be empty, so Text is the safe starting point for both.
+The record title is not a field: v2 sets it through the special `name` key,
+filled from the first and last name with the login as a fallback.
 
 **Utils folder** (`NETHUNT_UTILS_FOLDER_ID`) — `finishedAt` and `errorMessage`
-as Text, `totalSynced`, `duration`, `createdRecords`, `updatedRecords` as
-Number.
+as text, `totalSynced`, `duration`, `createdRecords`, `updatedRecords` as
+number.
 
-`finishedAt` must be Text: it is read back and parsed with `new Date()` to work
-out the sync window, and a Date field can come back without the time of day.
+`finishedAt` must be text: it is read back and parsed with `new Date()` to work
+out the sync window.
 
 ### Sharing the records folder with the team
 
-The sync sends only its own 21 fields, and NetHunt leaves fields absent from an
-update alone — so any field the team adds, such as `Comment`, is safe by
-construction and needs no code change.
+`PATCH` touches only the fields it is given, so any field the team adds — a
+`Comment`, say — is safe by construction, not by convention.
 
-The 21 synced fields should be made read-only for everyone else through **Limit
-field editing** on each field. Without that, a manual correction survives until
-the next run and then silently disappears, which is worse than not being able to
-make it. **Leave the integration account among those allowed to edit**, or the
-sync loses the right to write its own fields.
+The 20 synced fields should still be made read-only for everyone else through
+**Limit field editing**, or a manual correction survives until the next run and
+then silently disappears. **Leave the integration account able to edit them**,
+or the sync loses the right to write its own fields.
 
 ### Verifying
 
 ```bash
-./deploy/inspect-nethunt.sh          # credentials, folder ids, field schemas
+./deploy/inspect-nethunt.sh          # token, folder ids, field names and types
 ./deploy/inspect-nethunt.sh --probe  # also writes one record into the utils folder
 ```
 
-No tunnel and no whitelisted IP required — unlike ClickHouse, the NetHunt API is
-reachable from anywhere, so this runs on a laptop.
+No tunnel or whitelisted IP required — the NetHunt API is reachable from
+anywhere, so this runs on a laptop.
 
-`--probe` settles three things the documentation does not, all three confirmed
-against the live tenant: `finishedAt` survives the round trip unchanged,
-`new-record` does return the newest record first, and `find-record` accepts the
-`Field=Value` syntax the code sends. Delete the probe record afterwards.
-
-Note that `folder-field` returns field names only — NetHunt does not expose
-field types through this endpoint, so the check verifies names, not types.
+Unlike v1, v2 reports field types, so the check catches a numeric field created
+as text or a date field that would reject every write. `--probe` confirms that
+`finishedAt` round-trips unchanged and that sorting returns the newest record:
+listing records returns them oldest first, and the sync window depends on
+getting the newest. Delete the probe record afterwards.
 
 ## Deployment (Dokploy)
 

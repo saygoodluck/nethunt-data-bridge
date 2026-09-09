@@ -1,103 +1,116 @@
 /*
- * Stand-in for the NetHunt zapier API, so the whole sync can run with no
- * credentials and no risk of writing into a real CRM folder.
+ * Stand-in for the NetHunt v2 REST API, so the whole sync can run with no
+ * credentials and no risk of writing into a real CRM.
  *
- * Implements only what index.js calls:
- *   GET  /api/v1/zapier/triggers/new-record/:folderId   - last sync metrics
- *   GET  /api/v1/zapier/searches/find-record/:folderId  - lookup by FundistUserID
- *   POST /api/v1/zapier/actions/create-record/:folderId
- *   POST /api/v1/zapier/actions/update-record/:recordId - 404 once a record is gone
+ * Implements what index.js calls:
+ *   GET    /api/v2/folders
+ *   GET    /api/v2/folders/:folderId                       - schema with types
+ *   POST   /api/v2/folders/:folderId/records               - 201 + record
+ *   GET    /api/v2/folders/:folderId/records               - oldest first
+ *   POST   /api/v2/folders/:folderId/records/filter        - equality, _exists, sort
+ *   PATCH  /api/v2/folders/:folderId/records/:recordId     - partial, 404 when gone
  *
- * Plus a small admin surface for testing, which the real API does not have:
+ * Plus a test surface the real API does not have:
  *   GET    /__admin/state
- *   DELETE /__admin/records/:recordId   - simulate a record deleted in the CRM
- *   POST   /__admin/records/:recordId/fields - simulate a manager editing a field
+ *   GET    /__admin/record?folder=&field=&value=  - lookup with names, not ids
+ *   POST   /__admin/records/:recordId/fields      - a manager editing by hand
+ *   DELETE /__admin/records/:recordId             - a record deleted in the CRM
  *   POST   /__admin/reset
+ * and a Telegram Bot API stub, so notifications can be exercised too.
  */
 
 import http from 'node:http';
 
 const PORT = Number(process.env.PORT) || 3010;
 
-// recordId -> {folderId, fields}
-const records = new Map();
-let nextId = 1;
+// Field types mirror the real tenant.
+const TEXT = ['singleLineText', 'STRING'];
+const NUM = ['number', 'NUMBER'];
 
-// Folder registry, shaped like the real tenant should be. Field names here are
-// the contract: index.js builds its payload from exactly these keys.
-const SYNCED_FIELDS = [
-    // NetHunt creates Name with every folder and uses it as the record title
-    ['Name', 'TEXT'],
-    ['FundistUserID', 'NUMBER'], ['Login', 'TEXT'],
-    ['FirstName', 'TEXT'], ['LastName', 'TEXT'],
-    ['Email', 'EMAIL'], ['PhoneNumber', 'PHONE'],
-    ['PhoneVerified', 'TEXT'], ['DateOfBirth', 'TEXT'],
-    ['Gender', 'TEXT'], ['Language', 'TEXT'],
-    ['Country', 'TEXT'], ['City', 'TEXT'], ['Timezone', 'TEXT'],
-    ['LastCreditDate', 'TEXT'], ['RegistrationDate', 'TEXT'],
-    ['LastLoginDate', 'TEXT'], ['PEP', 'TEXT'],
-    ['AccountStatus', 'TEXT'],
-    ['TotalDeposit', 'NUMBER'], ['TotalWithdraw', 'NUMBER']
-];
-
-const folders = {
+const folderDefs = {
     users: {
         name: 'Players',
-        // Comment is owned by managers; the sync never sends it
-        fields: [...SYNCED_FIELDS, ['Comment', 'TEXT']]
+        fields: [
+            ['Name', ...TEXT], ['FundistUserID', ...NUM], ['Login', ...TEXT],
+            ['FirstName', ...TEXT], ['LastName', ...TEXT], ['Email', ...TEXT],
+            ['PhoneNumber', ...TEXT], ['PhoneVerified', ...TEXT],
+            ['DateOfBirth', ...TEXT], ['Gender', ...TEXT], ['Language', ...TEXT],
+            ['City', ...TEXT], ['Timezone', ...TEXT], ['Country', ...TEXT],
+            ['LastCreditDate', ...TEXT], ['RegistrationDate', ...TEXT],
+            ['LastLoginDate', ...TEXT], ['PEP', ...TEXT], ['AccountStatus', ...TEXT],
+            ['TotalDeposit', ...NUM], ['TotalWithdraw', ...NUM],
+            // owned by the team; the sync must never touch it
+            ['Comment', ...TEXT]
+        ]
     },
     utils: {
-        name: 'Sync metrics',
+        name: 'Log Data',
         fields: [
-            ['Name', 'TEXT'],
-            ['finishedAt', 'TEXT'], ['totalSynced', 'NUMBER'],
-            ['duration', 'NUMBER'], ['createdRecords', 'NUMBER'],
-            ['updatedRecords', 'NUMBER'], ['errorMessage', 'TEXT']
+            ['Name', ...TEXT], ['finishedAt', ...TEXT], ['totalSynced', ...NUM],
+            ['duration', ...NUM], ['createdRecords', ...NUM],
+            ['updatedRecords', ...NUM], ['errorMessage', ...TEXT]
         ]
     }
 };
 
-const folderList = () => Object.entries(folders).map(([id, f]) => ({id, name: f.name}));
+// field ids are per folder, assigned once, stable for the process lifetime
+const folders = Object.fromEntries(Object.entries(folderDefs).map(([id, def]) => [
+    id,
+    {
+        id,
+        name: def.name,
+        fields: def.fields.map(([name, type, valueType], i) => ({
+            id: String(i + 1), name, type, valueType, multiValue: false
+        }))
+    }
+]));
+
+const fieldByName = (folderId, name) =>
+    folders[folderId]?.fields.find(f => f.name === name);
+
+// recordId -> {folderId, fields (keyed by field id, plus `name`), createdAt, updatedAt}
+const records = new Map();
+let nextId = 1;
+
+const sentMessages = [];
+let pendingUpdates = [];
+let updateId = 1;
 
 const json = (res, status, body) => {
-    const payload = JSON.stringify(body);
     res.writeHead(status, {'Content-Type': 'application/json'});
-    res.end(payload);
+    res.end(JSON.stringify(body));
 };
 
 const readBody = (req) => new Promise((resolve, reject) => {
     let raw = '';
-    req.on('data', chunk => raw += chunk);
+    req.on('data', c => raw += c);
     req.on('end', () => {
         if (!raw) return resolve({});
-        try {
-            resolve(JSON.parse(raw));
-        } catch (err) {
-            reject(err);
-        }
+        try { resolve(JSON.parse(raw)); } catch (err) { reject(err); }
     });
     req.on('error', reject);
 });
 
-// "FundistUserID=123" or "Name:Doe" -> {field, value}. Both separators are
-// accepted because which one the real API wants is still an open question.
-const parseQuery = (query) => {
-    const match = /^([A-Za-z0-9_]+)[=:]([\s\S]*)$/.exec(query || '');
-    return match ? {field: match[1], value: match[2]} : null;
-};
+const shape = (id, r) => ({
+    id,
+    folderId: r.folderId,
+    createdAt: r.createdAt,
+    createdISO: new Date(r.createdAt).toISOString(),
+    updatedAt: r.updatedAt,
+    updatedISO: new Date(r.updatedAt).toISOString(),
+    fields: r.fields
+});
 
-const applyFieldActions = (fields, fieldActions) => {
-    for (const [key, action] of Object.entries(fieldActions || {})) {
-        fields[key] = action.add;
+// only what index.js actually sends: bare equality and {_exists: true}
+const matches = (record, filter) => Object.entries(filter || {}).every(([key, cond]) => {
+    const value = record.fields[key];
+    if (cond && typeof cond === 'object') {
+        if ('_exists' in cond) return value !== undefined && value !== '';
+        if ('_eq' in cond) return String(value) === String(cond._eq);
+        return true;
     }
-    return fields;
-};
-
-// --- Telegram Bot API stand-in ---------------------------------------------
-// Lets the notification logic be exercised without a real bot token.
-const sentMessages = [];
-let pendingUpdates = [];
-let updateId = 1;
+    return String(value) === String(cond);
+});
 
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -109,10 +122,43 @@ const server = http.createServer(async (req, res) => {
         if (path === '/__admin/state' && method === 'GET') {
             return json(res, 200, {
                 count: records.size,
-                records: [...records.entries()].map(([id, r]) => ({
-                    id, folderId: r.folderId, FundistUserID: r.fields.FundistUserID
-                }))
+                records: [...records.entries()].map(([id, r]) => {
+                    const idField = fieldByName(r.folderId, 'FundistUserID');
+                    return {id, folderId: r.folderId,
+                            FundistUserID: idField ? r.fields[idField.id] : undefined};
+                })
             });
+        }
+
+        // lookup by field name, so tests do not have to know field ids
+        if (path === '/__admin/record' && method === 'GET') {
+            const folderId = url.searchParams.get('folder');
+            const field = fieldByName(folderId, url.searchParams.get('field'));
+            const wanted = url.searchParams.get('value');
+            if (!field) return json(res, 404, {error: 'Unknown folder or field'});
+
+            const hit = [...records.entries()].find(([, r]) =>
+                r.folderId === folderId && String(r.fields[field.id]) === String(wanted));
+            if (!hit) return json(res, 404, {error: 'Not found'});
+
+            const named = Object.fromEntries(folders[folderId].fields
+                .filter(f => hit[1].fields[f.id] !== undefined)
+                .map(f => [f.name, hit[1].fields[f.id]]));
+            return json(res, 200, {id: hit[0], name: hit[1].fields.name, fields: named});
+        }
+
+        const adminFields = /^\/__admin\/records\/([^/]+)\/fields$/.exec(path);
+        if (adminFields && method === 'POST') {
+            const record = records.get(adminFields[1]);
+            if (!record) return json(res, 404, {error: 'Record not found'});
+            const body = await readBody(req);
+            for (const [name, value] of Object.entries(body.fields || {})) {
+                const field = fieldByName(record.folderId, name);
+                if (field) record.fields[field.id] = value;
+            }
+            record.updatedAt = Date.now();
+            console.log(`[admin] manager edited ${adminFields[1]}: ${Object.keys(body.fields || {}).join(', ')}`);
+            return json(res, 200, shape(adminFields[1], record));
         }
 
         if (path.startsWith('/__admin/records/') && method === 'DELETE') {
@@ -120,17 +166,6 @@ const server = http.createServer(async (req, res) => {
             const existed = records.delete(id);
             console.log(`[admin] delete ${id}: ${existed ? 'removed' : 'not found'}`);
             return json(res, existed ? 200 : 404, {deleted: existed});
-        }
-
-        // a manager editing a field by hand, bypassing the sync entirely
-        const adminFields = /^\/__admin\/records\/([^/]+)\/fields$/.exec(path);
-        if (adminFields && method === 'POST') {
-            const record = records.get(adminFields[1]);
-            if (!record) return json(res, 404, {error: 'Record not found'});
-            const body = await readBody(req);
-            Object.assign(record.fields, body.fields || {});
-            console.log(`[admin] manager edited ${adminFields[1]}: ${Object.keys(body.fields || {}).join(', ')}`);
-            return json(res, 200, {fields: record.fields});
         }
 
         if (path === '/__admin/reset' && method === 'POST') {
@@ -144,7 +179,6 @@ const server = http.createServer(async (req, res) => {
             return json(res, 200, sentMessages);
         }
 
-        // queue a command as if a user had typed it in the chat
         if (path === '/__admin/telegram/send-command' && method === 'POST') {
             const body = await readBody(req);
             pendingUpdates.push({
@@ -170,67 +204,91 @@ const server = http.createServer(async (req, res) => {
             if (tg[1] === 'getUpdates') {
                 const result = pendingUpdates;
                 pendingUpdates = [];
-                // answer immediately rather than long-polling
                 return json(res, 200, {ok: true, result});
             }
             return json(res, 200, {ok: true, result: {}});
         }
 
-        // --- zapier api ------------------------------------------------------
-        if (/^\/api\/v1\/zapier\/triggers\/(readable|writable)-folder$/.test(path) && method === 'GET') {
-            return json(res, 200, folderList());
-        }
-
-        const folderField = /^\/api\/v1\/zapier\/triggers\/folder-field\/(.+)$/.exec(path);
-        if (folderField && method === 'GET') {
-            const folder = folders[folderField[1]];
-            if (!folder) return json(res, 404, {error: 'Folder not found'});
-            return json(res, 200, folder.fields.map(([name, type]) => ({name, type})));
-        }
-
-        const trigger = /^\/api\/v1\/zapier\/triggers\/new-record\/(.+)$/.exec(path);
-        if (trigger && method === 'GET') {
-            const folderId = trigger[1];
-            // newest first, like the real trigger feed
-            const inFolder = [...records.values()]
-                .filter(r => r.folderId === folderId)
-                .reverse();
-            return json(res, 200, inFolder.map(r => ({fields: r.fields})));
-        }
-
-        const search = /^\/api\/v1\/zapier\/searches\/find-record\/(.+)$/.exec(path);
-        if (search && method === 'GET') {
-            const folderId = search[1];
-            const parsed = parseQuery(url.searchParams.get('query'));
-            if (!parsed) return json(res, 200, []);
-            const hits = [...records.entries()]
-                .filter(([, r]) => r.folderId === folderId
-                    && String(r.fields[parsed.field] ?? '') === String(parsed.value))
-                .map(([id, r]) => ({id, fields: r.fields}));
-            return json(res, 200, hits);
-        }
-
-        const create = /^\/api\/v1\/zapier\/actions\/create-record\/(.+)$/.exec(path);
-        if (create && method === 'POST') {
-            const folderId = create[1];
-            const body = await readBody(req);
-            const recordId = `rec_${nextId++}`;
-            records.set(recordId, {folderId, fields: {...body.fields}});
-            return json(res, 200, {recordId});
-        }
-
-        const update = /^\/api\/v1\/zapier\/actions\/update-record\/(.+)$/.exec(path);
-        if (update && method === 'POST') {
-            const recordId = update[1];
-            const record = records.get(recordId);
-            // the case the Redis invalidation exists for
-            if (!record) {
-                console.log(`[mock] 404 update of missing record ${recordId}`);
-                return json(res, 404, {error: 'Record not found'});
+        // --- nethunt v2 ------------------------------------------------------
+        if (path.startsWith('/api/v2/')) {
+            if (!/^Bearer\s+\S+/.test(req.headers.authorization || '')) {
+                return json(res, 401, {code: 'UNAUTHORIZED', message: 'missing bearer token'});
             }
+        }
+
+        if (path === '/api/v2/folders' && method === 'GET') {
+            return json(res, 200, {folders: Object.values(folders).map(f => ({id: f.id, name: f.name}))});
+        }
+
+        const folderGet = /^\/api\/v2\/folders\/([^/]+)$/.exec(path);
+        if (folderGet && method === 'GET') {
+            const folder = folders[folderGet[1]];
+            if (!folder) return json(res, 404, {code: 'FOLDER_NOT_FOUND'});
+            return json(res, 200, folder);
+        }
+
+        const filter = /^\/api\/v2\/folders\/([^/]+)\/records\/filter$/.exec(path);
+        if (filter && method === 'POST') {
+            const folderId = filter[1];
+            if (!folders[folderId]) return json(res, 404, {code: 'FOLDER_NOT_FOUND'});
             const body = await readBody(req);
-            applyFieldActions(record.fields, body.fieldActions);
-            return json(res, 200, {recordId});
+            const limit = Number(url.searchParams.get('limit')) || 100;
+
+            let hits = [...records.entries()]
+                .filter(([, r]) => r.folderId === folderId)
+                .filter(([, r]) => matches(r, body.filter));
+
+            for (const rule of (body.sort || []).slice().reverse()) {
+                const [key, dir] = Object.entries(rule)[0];
+                const of = ([, r]) => key === 'created' ? r.createdAt
+                    : key === 'updated' ? r.updatedAt
+                    : r.fields[key];
+                hits.sort((a, b) => (of(a) > of(b) ? 1 : of(a) < of(b) ? -1 : 0) * dir);
+            }
+
+            return json(res, 200, {
+                total: hits.length,
+                records: hits.slice(0, limit).map(([id, r]) => shape(id, r))
+            });
+        }
+
+        const recordsPath = /^\/api\/v2\/folders\/([^/]+)\/records$/.exec(path);
+        if (recordsPath && method === 'POST') {
+            const folderId = recordsPath[1];
+            if (!folders[folderId]) return json(res, 404, {code: 'FOLDER_NOT_FOUND'});
+            const body = await readBody(req);
+            const now = Date.now();
+            const id = `rec_${nextId++}`;
+            records.set(id, {folderId, fields: {...body.fields}, createdAt: now, updatedAt: now});
+            // the real API answers 201 here, not 200
+            return json(res, 201, shape(id, records.get(id)));
+        }
+
+        if (recordsPath && method === 'GET') {
+            const folderId = recordsPath[1];
+            const list = [...records.entries()]
+                .filter(([, r]) => r.folderId === folderId)
+                // oldest first, as documented
+                .sort((a, b) => a[1].updatedAt - b[1].updatedAt)
+                .map(([id, r]) => shape(id, r));
+            return json(res, 200, {records: list});
+        }
+
+        const one = /^\/api\/v2\/folders\/([^/]+)\/records\/([^/]+)$/.exec(path);
+        if (one && (method === 'PATCH' || method === 'GET')) {
+            const record = records.get(one[2]);
+            // the case the Redis invalidation exists for
+            if (!record || record.folderId !== one[1]) {
+                console.log(`[mock] RECORD_NOT_FOUND ${one[2]}`);
+                return json(res, 404, {code: 'RECORD_NOT_FOUND'});
+            }
+            if (method === 'GET') return json(res, 200, shape(one[2], record));
+
+            const body = await readBody(req);
+            // partial by nature: fields not named here keep their value
+            Object.assign(record.fields, body.fields || {});
+            record.updatedAt = Date.now();
+            return json(res, 200, shape(one[2], record));
         }
 
         return json(res, 404, {error: `No mock route for ${method} ${path}`});
@@ -240,4 +298,4 @@ const server = http.createServer(async (req, res) => {
     }
 });
 
-server.listen(PORT, () => console.log(`NetHunt mock listening on ${PORT}`));
+server.listen(PORT, () => console.log(`NetHunt v2 mock listening on ${PORT}`));

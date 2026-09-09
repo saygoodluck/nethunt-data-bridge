@@ -21,18 +21,19 @@ const PORT = process.env.PORT || 3000;
 
 let clickhouseClient;
 let tunnelServer = null;
-// the process stays alive while this is false; it is not a fatal condition
+// the process stays alive while these are false; neither is fatal
 let clickhouseReady = false;
 let connecting = false;
+let netHuntReady = false;
 
 // Local development: ClickHouse is reachable directly, no bastion in between
 const skipSSHTunnel = process.env.SKIP_SSH_TUNNEL === '1';
-const netHuntBaseUrl = process.env.NETHUNT_BASE_URL || 'https://nethunt.com/api/v1/zapier';
+const netHuntBaseUrl = process.env.NETHUNT_BASE_URL || 'https://nethunt.com/api/v2';
 
 const requiredEnvVars = [
     'CLICKHOUSE_HOST', 'CLICKHOUSE_PORT', 'CLICKHOUSE_USER',
     'CLICKHOUSE_PASSWORD', 'CLICKHOUSE_DATABASE', 'NETHUNT_FOLDER_ID',
-    'NETHUNT_USER', 'NETHUNT_API_KEY'
+    'NETHUNT_UTILS_FOLDER_ID', 'NETHUNT_API_TOKEN', 'SYNC_API_KEY'
 ];
 
 if (!skipSSHTunnel) {
@@ -114,6 +115,55 @@ const redisConfig = {
 
 // NetHunt statuses meaning the cached record no longer exists
 const STALE_RECORD_STATUSES = [404, 410];
+
+// Retrying anything else is pointless: a rejected payload stays rejected.
+// 429 is rate limiting, 409 an optimistic-concurrency clash, 408 a timeout.
+const RETRYABLE_STATUSES = [408, 409, 429];
+
+const recordsFolder = () => process.env.NETHUNT_FOLDER_ID;
+const utilsFolder = () => process.env.NETHUNT_UTILS_FOLDER_ID;
+
+// v2 keys field values by field id, so the schema is resolved once at startup.
+// Each entry is {id, valueType}: the declared type decides how a value is
+// serialised, which keeps a text field that should have been numeric working.
+const fieldIds = {records: new Map(), utils: new Map()};
+
+const RECORD_FIELD_NAMES = [
+    'FundistUserID', 'Login', 'FirstName', 'LastName', 'Email', 'PhoneNumber',
+    'PhoneVerified', 'DateOfBirth', 'Gender', 'Language', 'Country', 'City',
+    'Timezone', 'LastCreditDate', 'RegistrationDate', 'LastLoginDate', 'PEP',
+    'AccountStatus', 'TotalDeposit', 'TotalWithdraw'
+];
+const UTILS_FIELD_NAMES = [
+    'finishedAt', 'totalSynced', 'duration', 'createdRecords',
+    'updatedRecords', 'errorMessage'
+];
+
+// values the sync sends as JSON numbers
+const NUMERIC_FIELDS = ['FundistUserID', 'TotalDeposit', 'TotalWithdraw'];
+// values the sync sends as plain strings; a real date field would demand
+// epoch milliseconds instead and reject every write
+const DATE_LIKE_FIELDS = [
+    'DateOfBirth', 'LastCreditDate', 'RegistrationDate', 'LastLoginDate'
+];
+
+async function netHunt(method, path, {body, params, timeout = 15000} = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await axios({
+            method,
+            url: `${netHuntBaseUrl}${path}`,
+            data: body,
+            params,
+            headers: {Authorization: `Bearer ${process.env.NETHUNT_API_TOKEN}`},
+            signal: controller.signal
+        });
+        return response.data;
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 const redisClient = await createRedisClient(redisConfig)
     .on('error', (err) => console.log('Redis Client Error', err))
@@ -286,7 +336,7 @@ const authenticate = (req, res, next) => {
     }
 
     const apiKey = authHeader.split(' ')[1];
-    if (apiKey !== process.env.NETHUNT_API_KEY) {
+    if (apiKey !== process.env.SYNC_API_KEY) {
         return res.status(401).json({error: 'Invalid API key'});
     }
 
@@ -299,15 +349,18 @@ app.get('/', async (req, res) => {
     res.json({
         status: 'ok',
         message: 'Service is operational',
-        clickhouse: clickhouseReady ? 'connected' : 'connecting'
+        clickhouse: clickhouseReady ? 'connected' : 'connecting',
+        nethunt: netHuntReady ? 'ready' : 'loading schema'
     });
 });
 
 app.get('/sync', authenticate, async (req, res) => {
-    if (!clickhouseReady) {
+    if (!clickhouseReady || !netHuntReady) {
         return res.status(503).json({
             status: 'error',
-            message: 'ClickHouse is not connected yet'
+            message: !clickhouseReady
+                ? 'ClickHouse is not connected yet'
+                : 'The NetHunt schema has not been read yet'
         });
     }
 
@@ -336,6 +389,7 @@ app.listen(PORT, () => {
 telegramBot.startPolling();
 telegramBot.notifyStartup().catch(console.error);
 connectWithRetry().catch(err => console.error('Connection loop stopped:', err));
+loadSchemaWithRetry().catch(err => console.error('Schema loop stopped:', err));
 
 sshClient.on('close', () => {
     if (skipSSHTunnel) return;
@@ -360,9 +414,9 @@ process.on('SIGINT', async () => {
 
 // Scheduled sync
 cron.schedule('0,30 * * * *', async () => {
-    if (!clickhouseReady) {
+    if (!clickhouseReady || !netHuntReady) {
         // otherwise every run would write a failed-sync record into NetHunt
-        console.warn('Skipping scheduled sync: ClickHouse is not connected');
+        console.warn('Skipping scheduled sync: dependencies are not ready');
         return;
     }
     console.log(`${new Date()} | Running scheduled task...`);
@@ -375,6 +429,42 @@ if (telegramBot.enabled && telegramBot.dailyReportAt) {
         telegramBot.sendDailyReport().catch(console.error);
     });
     console.log(`Daily Telegram report scheduled at ${telegramBot.dailyReportAt}`);
+}
+
+// Same treatment as the ClickHouse connection: keep serving and keep trying,
+// rather than exiting and letting the restart policy hide the reason.
+async function loadSchemaWithRetry() {
+    let attempt = 0;
+    let alerted = false;
+
+    while (!netHuntReady) {
+        try {
+            await loadNetHuntSchema();
+            netHuntReady = true;
+            if (alerted) {
+                await telegramBot.sendAlert('\u{1F7E2} <b>NetHunt schema loaded</b>\n\nRecovered.');
+            }
+        } catch (err) {
+            attempt++;
+            const delay = Math.min(
+                connectRetry.minTimeout * Math.pow(connectRetry.factor, attempt - 1),
+                connectRetry.maxTimeout
+            );
+            console.error(
+                `NetHunt schema load failed (attempt ${attempt}): ${err.message}. ` +
+                `Retrying in ${(delay / 1000).toFixed(0)}s`
+            );
+            if (attempt === connectRetry.alertAfterAttempts && !alerted) {
+                alerted = true;
+                await telegramBot.sendAlert(
+                    `\u{1F534} <b>Cannot read the NetHunt schema</b>\n\n` +
+                    `<code>${err.message}</code>\n\n` +
+                    `Syncing is paused until this resolves.`
+                );
+            }
+            await sleep(delay);
+        }
+    }
 }
 
 async function executeSync() {
@@ -447,16 +537,21 @@ async function syncRecords() {
 }
 
 async function getLastSyncTime() {
-    const response = await axios.get(
-        `${netHuntBaseUrl}/triggers/new-record/${process.env.NETHUNT_UTILS_FOLDER_ID}`,
-        {
-            auth: {
-                username: process.env.NETHUNT_USER,
-                password: process.env.NETHUNT_API_KEY
-            }
-        }
-    );
-    return response.data[0]?.fields;
+    const finishedAt = fieldIds.utils.get('finishedAt');
+
+    // Listing records returns them oldest first, so the newest metrics record
+    // has to be asked for by sorting -- taking the first of a plain list would
+    // read the very first sync ever and blow the window wide open.
+    const data = await netHunt('post', `/folders/${utilsFolder()}/records/filter`, {
+        body: {
+            filter: {[finishedAt.id]: {_exists: true}},
+            sort: [{created: -1}]
+        },
+        params: {limit: 1}
+    });
+
+    const record = (data.records || [])[0];
+    return record ? {finishedAt: record.fields?.[finishedAt.id]} : null;
 }
 
 function calculateInterval(lastSyncTime) {
@@ -477,22 +572,16 @@ function calculateInterval(lastSyncTime) {
 
 async function sendMetrics(data) {
     try {
-        const response = await axios.post(
-            `${netHuntBaseUrl}/actions/create-record/${process.env.NETHUNT_UTILS_FOLDER_ID}`,
-            {
-                fields: data,
-                timeZone: "Europe/Warsaw"
-            },
-            {
-                auth: {
-                    username: process.env.NETHUNT_USER,
-                    password: process.env.NETHUNT_API_KEY
+        return await netHunt('post', `/folders/${utilsFolder()}/records`, {
+            body: {
+                fields: {
+                    name: `Sync ${new Date(data.finishedAt).toISOString()}`,
+                    ...toFieldPayload(data, fieldIds.utils)
                 }
             }
-        );
-        return response.data;
+        });
     } catch (err) {
-        console.error('Error writing last sync time:', err);
+        console.error('Error writing last sync time:', err.message);
     }
 }
 
@@ -573,75 +662,121 @@ async function cacheRecordId(fundistUserId, recordId) {
 }
 
 // NetHunt API Helpers
-async function searchNetHuntRecord(userId) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
+//
+// v2 addresses field values by field id, so the schema of both folders is read
+// once at startup. A folder missing a field the sync writes is fatal here
+// rather than a silently dropped value on the first record.
+async function loadFolderSchema(folderId, expectedNames, label) {
+    const folder = await netHunt('get', `/folders/${folderId}`);
+    const byName = new Map((folder.fields || []).map(f => [f.name, f]));
 
-    try {
-        const response = await axios.get(
-            `${netHuntBaseUrl}/searches/find-record/${process.env.NETHUNT_FOLDER_ID}`,
-            {
-                params: {query: `FundistUserID=${userId}`},
-                auth: {
-                    username: process.env.NETHUNT_USER,
-                    password: process.env.NETHUNT_API_KEY
-                },
-                signal: controller.signal
-            }
+    const missing = expectedNames.filter(name => !byName.has(name));
+    if (missing.length) {
+        throw new Error(
+            `NetHunt folder "${folder.name}" (${label}, ${folderId}) has no field(s): ${missing.join(', ')}`
         );
-        return response.data;
-    } finally {
-        clearTimeout(timeout);
     }
+
+    const ids = new Map(expectedNames.map(name => {
+        const field = byName.get(name);
+        return [name, {id: field.id, valueType: field.valueType}];
+    }));
+
+    // A date field wants epoch milliseconds; the sync sends formatted strings,
+    // so such a field would reject every write. Worth stopping for.
+    const wrongDates = DATE_LIKE_FIELDS
+        .filter(name => byName.has(name) && ['DATE', 'TIME'].includes(byName.get(name).valueType));
+    if (wrongDates.length) {
+        throw new Error(
+            `NetHunt fields ${wrongDates.join(', ')} are date fields, but the sync sends text. ` +
+            `Recreate them as text, or convert the values to epoch milliseconds first.`
+        );
+    }
+
+    // Values are coerced to the declared type on the way out, so a mismatch is
+    // survivable -- but worth saying out loud, because a numeric field sorts
+    // and filters in the CRM and a text one does not
+    for (const name of NUMERIC_FIELDS) {
+        const field = byName.get(name);
+        if (field && field.valueType !== 'NUMBER') {
+            console.warn(
+                `NetHunt field ${name} is ${field.valueType}; values are sent as text. ` +
+                `Recreate it as a number field to sort and filter by it in the CRM.`
+            );
+        }
+    }
+
+    console.log(`NetHunt folder "${folder.name}" (${label}): ${expectedNames.length} fields resolved`);
+    return ids;
+}
+
+async function loadNetHuntSchema() {
+    fieldIds.records = await loadFolderSchema(recordsFolder(), RECORD_FIELD_NAMES, 'records');
+    fieldIds.utils = await loadFolderSchema(utilsFolder(), UTILS_FIELD_NAMES, 'utils');
+}
+
+// Matches the value to what the field actually declares. ClickHouse hands us
+// numbers for the money columns, but those fields may well have been created as
+// text; sending the wrong shape is rejected outright, so convert instead.
+function coerce(value, valueType) {
+    if (valueType === 'NUMBER' && typeof value !== 'number') {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+    }
+    if (valueType === 'STRING' && typeof value !== 'string') {
+        // String(date) yields a locale-shaped stamp; the value is read back and
+        // parsed to work out the sync window, so it has to round-trip exactly
+        return value instanceof Date ? value.toISOString() : String(value);
+    }
+    return value;
+}
+
+// Turns a name-keyed object into the id-keyed payload v2 expects. Null values
+// are dropped rather than sent: there is nothing to clear on a new record.
+function toFieldPayload(values, fields) {
+    const payload = {};
+    for (const [name, value] of Object.entries(values)) {
+        const field = fields.get(name);
+        if (!field || value === null || value === undefined) continue;
+        const converted = coerce(value, field.valueType);
+        if (converted !== null && converted !== undefined) {
+            payload[field.id] = converted;
+        }
+    }
+    return payload;
+}
+
+function recordPayload(record) {
+    return {
+        // `name` is not a folder field in v2, it is the record's display name
+        name: displayName(record),
+        ...toFieldPayload(mapRecordFields(record), fieldIds.records)
+    };
+}
+
+async function searchNetHuntRecord(userId) {
+    const key = fieldIds.records.get('FundistUserID');
+    const data = await netHunt('post', `/folders/${recordsFolder()}/records/filter`, {
+        body: {filter: {[key.id]: coerce(userId, key.valueType)}},
+        params: {limit: 1},
+        timeout: 10000
+    });
+    return data.records || [];
 }
 
 async function createNetHuntRecord(record) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-
-    try {
-        const response = await axios.post(
-            `${netHuntBaseUrl}/actions/create-record/${process.env.NETHUNT_FOLDER_ID}`,
-            {
-                fields: mapRecordFields(record),
-                timeZone: "Europe/Warsaw"
-            },
-            {
-                auth: {
-                    username: process.env.NETHUNT_USER,
-                    password: process.env.NETHUNT_API_KEY
-                },
-                signal: controller.signal
-            }
-        );
-        return response.data;
-    } finally {
-        clearTimeout(timeout);
-    }
+    const data = await netHunt('post', `/folders/${recordsFolder()}/records`, {
+        body: {fields: recordPayload(record)}
+    });
+    return {recordId: data.id};
 }
 
-async function updateNetHuntRecord(recordId, data) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-
-    try {
-        const response = await axios.post(
-            `${netHuntBaseUrl}/actions/update-record/${recordId}`,
-            {
-                fieldActions: mapRecordFieldsForUpdate(data)
-            },
-            {
-                auth: {
-                    username: process.env.NETHUNT_USER,
-                    password: process.env.NETHUNT_API_KEY
-                },
-                signal: controller.signal
-            }
-        );
-        return response.data;
-    } finally {
-        clearTimeout(timeout);
-    }
+// PATCH touches only the fields it is given, so anything the team owns -- the
+// Comment field above all -- is left alone by construction.
+async function updateNetHuntRecord(recordId, record) {
+    return netHunt('patch', `/folders/${recordsFolder()}/records/${recordId}`, {
+        body: {fields: recordPayload(record)}
+    });
 }
 
 // NetHunt's built-in Name field is the record title shown in lists and cards.
@@ -653,7 +788,6 @@ function displayName(record) {
 
 function mapRecordFields(record) {
     return {
-        Name: displayName(record),
         FundistUserID: record.FundistUserID,
         Login: record.Login,
         FirstName: record.FirstName,
@@ -677,16 +811,6 @@ function mapRecordFields(record) {
     };
 }
 
-function mapRecordFieldsForUpdate(record) {
-    const fields = mapRecordFields(record);
-    return Object.fromEntries(
-        Object.entries(fields).map(([key, value]) => [
-            key,
-            {overwrite: true, add: value}
-        ])
-    );
-}
-
 // Utils
 function chunkArray(arr, size) {
     return Array.from(
@@ -701,11 +825,21 @@ async function withRetry(fn, config) {
         try {
             return await fn();
         } catch (err) {
-            if (++attempts > config.retries) throw err;
-            const delay = Math.min(
-                config.minTimeout * Math.pow(config.factor, attempts - 1),
-                config.maxTimeout
-            );
+            const status = err.response?.status;
+            // a rejected payload stays rejected however often it is resent
+            const worthRetrying = status === undefined
+                || status >= 500
+                || RETRYABLE_STATUSES.includes(status);
+            if (!worthRetrying || ++attempts > config.retries) throw err;
+
+            // when rate limited the API says how long to wait; obey it
+            const retryAfter = Number(err.response?.headers?.['retry-after']);
+            const delay = Number.isFinite(retryAfter) && retryAfter > 0
+                ? retryAfter * 1000
+                : Math.min(
+                    config.minTimeout * Math.pow(config.factor, attempts - 1),
+                    config.maxTimeout
+                );
             await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
