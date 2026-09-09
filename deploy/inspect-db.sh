@@ -69,6 +69,36 @@ q "SELECT name, engine, sorting_key, formatReadableQuantity(total_rows) AS rows
    WHERE database = '${DB}' AND name IN ('UserHistory','CountriesNew','Turnovers')
    FORMAT Vertical"
 
+# --- the DDL, for reviewing the query against the real schema ---------------
+step "Schema"
+for table in UserHistory CountriesNew Turnovers; do
+    printf '\n   \033[1m%s\033[0m\n' "$table"
+    q "SHOW CREATE TABLE ${table}" | sed 's/\\n/\n/g' | sed 's/^/     /'
+done
+
+step "Storage"
+q "SELECT table,
+          formatReadableQuantity(sum(rows))                AS rows,
+          formatReadableSize(sum(data_compressed_bytes))   AS compressed,
+          formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed,
+          count()                                          AS parts
+   FROM system.parts
+   WHERE database = '${DB}' AND active
+     AND table IN ('UserHistory','CountriesNew','Turnovers')
+   GROUP BY table ORDER BY table FORMAT PrettyCompactMonoBlock"
+
+step "Types of the columns the query reads"
+q "SELECT table, name, type
+   FROM system.columns
+   WHERE database = '${DB}'
+     AND table IN ('UserHistory','CountriesNew','Turnovers')
+     AND name IN ('UserID','ID','CountryID','RecordTime','RecordDate','LastUpdated',
+                  'Login','Name','LastName','Email','Phone','PhoneVerified',
+                  'DateOfBirth','DateOfBirthNew','Gender','Language','City','Timezone',
+                  'LastCreditDate','RegistrationDate','LastLoginDate','PEP','Status',
+                  'Deposit','Withdraw')
+   ORDER BY table, name FORMAT PrettyCompactMonoBlock"
+
 # --- which birth column is the real one -------------------------------------
 step "Birth-date columns"
 q "SELECT name, type FROM system.columns
@@ -100,50 +130,74 @@ done
 
 # --- what the join actually costs -------------------------------------------
 if [[ $RUN_TIMING -eq 1 ]]; then
-    step "Cost of the Turnovers join (interval: 60 minutes)"
+    step "Paging cost: OFFSET versus keyset"
+    note "the same page read two ways; numbers come from X-ClickHouse-Summary"
 
     timed() {
-        local label="$1" sql="$2" hdr t summary
+        local label="$1" sql="$2" hdr t rows bytes summary
         hdr=$(mktemp)
-        t=$(curl -s -o /dev/null -D "$hdr" -w '%{time_total}' --max-time 300 \
+        t=$(curl -s -o /dev/null -D "$hdr" -w '%{time_total}' --max-time 600 \
             "${CH}/?database=${DB}" "${CH_AUTH[@]}" --data-binary "$sql")
         summary=$(grep -i '^x-clickhouse-summary' "$hdr" | tr -d '\r' | cut -d' ' -f2-)
         rm -f "$hdr"
-        printf '   %-10s %8ss\n' "$label" "$t"
-        if [[ -n "$summary" ]]; then
-            # ClickHouse reports these as quoted strings; pull them out without
-            # depending on a JSON parser being present
-            local rows bytes
-            rows=$(sed -n 's/.*"read_rows":"\{0,1\}\([0-9]*\).*/\1/p' <<< "$summary")
-            bytes=$(sed -n 's/.*"read_bytes":"\{0,1\}\([0-9]*\).*/\1/p' <<< "$summary")
-            if [[ -n "$rows" ]]; then
-                awk -v r="$rows" -v b="${bytes:-0}" 'BEGIN {
-                    printf "        rows read: %'"'"'d   bytes read: %.2f GB\n", r, b/1e9
-                }'
-            else
-                note "  $summary"
-            fi
+        rows=$(sed -n 's/.*"read_rows":"\{0,1\}\([0-9]*\).*/\1/p' <<< "$summary")
+        bytes=$(sed -n 's/.*"read_bytes":"\{0,1\}\([0-9]*\).*/\1/p' <<< "$summary")
+        printf '   %-32s %8ss' "$label" "$t"
+        if [[ -n "$rows" ]]; then
+            awk -v r="$rows" -v b="${bytes:-0}" 'BEGIN {
+                printf "   rows: %'"'"'d   %.2f GB\n", r, b/1e9
+            }'
+        else
+            echo
         fi
     }
 
-    COMMON="FROM UserHistory uh
-            JOIN CountriesNew c ON c.ID = uh.CountryID"
-    TAIL="WHERE uh.LastUpdated > now() - INTERVAL 60 MINUTE
-          GROUP BY uh.UserID"
+    # a year-wide window: the shape a backfill actually runs with
+    SINCE=$(( $(date +%s) - 365*24*3600 ))
 
-    note "the current form aggregates the whole table; this may take a while"
-    timed "before" "SELECT count() FROM (SELECT uh.UserID ${COMMON}
-        LEFT JOIN (SELECT UserID, sum(Deposit)/100 d, sum(Withdraw)/100 w
-                   FROM Turnovers GROUP BY UserID) t ON uh.UserID = t.UserID
-        ${TAIL})"
+    # measure at half the population, so there is a page on both sides of it
+    USERS=$(q "SELECT uniq(UserID) FROM UserHistory WHERE LastUpdated > toDateTime(${SINCE})" | tr -d '\r\n')
+    DEEP=$(( ${USERS:-0} / 2 ))
+    [[ $DEEP -lt 1 ]] && DEEP=1
+    note "users in this window: ${USERS:-?}; measuring at depth ${DEEP}"
 
-    timed "after" "SELECT count() FROM (SELECT uh.UserID ${COMMON}
-        LEFT JOIN (SELECT UserID, sum(Deposit)/100 d, sum(Withdraw)/100 w
-                   FROM Turnovers
+    note "window: one year back, page size 100"
+    timed "OFFSET 0" "SELECT count() FROM (SELECT uh.UserID FROM UserHistory uh
+        WHERE uh.LastUpdated > toDateTime(${SINCE})
+        GROUP BY uh.UserID ORDER BY uh.UserID DESC LIMIT 100 OFFSET 0)"
+
+    timed "OFFSET ${DEEP}" "SELECT count() FROM (SELECT uh.UserID FROM UserHistory uh
+        WHERE uh.LastUpdated > toDateTime(${SINCE})
+        GROUP BY uh.UserID ORDER BY uh.UserID DESC LIMIT 100 OFFSET ${DEEP})"
+
+    # the id that deep page starts at, so the keyset read covers the same rows
+    CURSOR=$(q "SELECT min(UserID) FROM (SELECT uh.UserID FROM UserHistory uh
+        WHERE uh.LastUpdated > toDateTime(${SINCE})
+        GROUP BY uh.UserID ORDER BY uh.UserID DESC LIMIT ${DEEP})" | tr -d '\r\n')
+    CURSOR=${CURSOR:-9007199254740991}
+
+    timed "keyset at the same depth" "SELECT count() FROM (SELECT uh.UserID FROM UserHistory uh
+        WHERE uh.LastUpdated > toDateTime(${SINCE}) AND uh.UserID < ${CURSOR}
+        GROUP BY uh.UserID ORDER BY uh.UserID DESC LIMIT 100)"
+
+    echo
+    note "the Turnovers join, bounded by the window versus by the page:"
+    timed "join bounded by the window" "SELECT count() FROM (SELECT uh.UserID FROM UserHistory uh
+        LEFT JOIN (SELECT UserID, sum(Deposit)/100 d FROM Turnovers
                    WHERE UserID IN (SELECT UserID FROM UserHistory
-                                    WHERE LastUpdated > now() - INTERVAL 60 MINUTE)
+                                    WHERE LastUpdated > toDateTime(${SINCE}))
                    GROUP BY UserID) t ON uh.UserID = t.UserID
-        ${TAIL})"
+        WHERE uh.LastUpdated > toDateTime(${SINCE}) AND uh.UserID < ${CURSOR}
+        GROUP BY uh.UserID ORDER BY uh.UserID DESC LIMIT 100)"
+
+    timed "join bounded by the page" "SELECT count() FROM (SELECT uh.UserID FROM UserHistory uh
+        LEFT JOIN (SELECT UserID, sum(Deposit)/100 d FROM Turnovers
+                   WHERE UserID IN (SELECT UserID FROM UserHistory
+                                    WHERE LastUpdated > toDateTime(${SINCE}) AND UserID < ${CURSOR}
+                                    GROUP BY UserID ORDER BY UserID DESC LIMIT 100)
+                   GROUP BY UserID) t ON uh.UserID = t.UserID
+        WHERE uh.LastUpdated > toDateTime(${SINCE}) AND uh.UserID < ${CURSOR}
+        GROUP BY uh.UserID ORDER BY uh.UserID DESC LIMIT 100)"
 fi
 
 echo
