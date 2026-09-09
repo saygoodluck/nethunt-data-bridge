@@ -13,6 +13,12 @@ set -euo pipefail
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTAINER=nethunt-dev-clickhouse
 
+# Credentials come from .env.dev rather than being repeated here. They belong to
+# a throwaway container holding invented data, but a password literal in a
+# script reads as a leak to a scanner -- and one source of truth is better
+# regardless, since the value also has to match docker-compose.dev.yml.
+set -a; . "$PROJ/.env.dev"; set +a
+
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     echo "$CONTAINER is not running. Start it with: npm run dev:up" >&2
     exit 1
@@ -20,7 +26,8 @@ fi
 
 ch() {
     docker exec -i "$CONTAINER" clickhouse-client \
-        --user bridge --password bridge --database analytics "$@"
+        --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" \
+        --database "$CLICKHOUSE_DATABASE" "$@"
 }
 
 echo "-> clearing tables"
