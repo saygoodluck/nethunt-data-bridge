@@ -427,6 +427,12 @@ app.get('/', async (req, res) => {
 });
 
 app.get('/sync', authenticate, async (req, res) => {
+    if (syncInProgress) {
+        return res.status(409).json({
+            status: 'error',
+            message: 'A sync is already running'
+        });
+    }
     if (!clickhouseReady || !netHuntReady) {
         return res.status(503).json({
             status: 'error',
@@ -486,6 +492,10 @@ process.on('SIGINT', async () => {
 
 // Scheduled sync
 cron.schedule('0,30 * * * *', async () => {
+    if (syncInProgress) {
+        console.warn('Skipping scheduled sync: the previous one is still running');
+        return;
+    }
     if (!clickhouseReady || !netHuntReady) {
         // otherwise every run would write a failed-sync record into NetHunt
         console.warn('Skipping scheduled sync: dependencies are not ready');
@@ -539,32 +549,51 @@ async function loadSchemaWithRetry() {
     }
 }
 
+// A wide-window backfill runs for hours while the schedule keeps firing every
+// half hour. Without this each tick would start another full pass over the same
+// data, splitting the request allowance between runs that duplicate each other.
+let syncInProgress = false;
+
 async function executeSync() {
+    if (syncInProgress) {
+        throw new Error('A sync is already running');
+    }
+    syncInProgress = true;
+
     const start = performance.now();
     // a failed sync still reports: zeros plus the error, instead of blowing up here
     let result = {totalSynced: 0, createdRecords: 0, updatedRecords: 0, skippedRecords: 0};
     let error = null;
+    let syncData;
+
+    // finally, not a plain assignment: a flag left set by an unexpected throw
+    // would stop every future run, which is worse than the overlap it prevents
     try {
-        result = await syncRecords();
-    } catch (err) {
-        error = err;
-        console.error('Sync error:', err);
+        try {
+            result = await syncRecords();
+        } catch (err) {
+            error = err;
+            console.error('Sync error:', err);
+        }
+
+        const duration = performance.now() - start;
+        console.log(
+            `Duration: ${(duration / 1000).toFixed(2)} seconds` +
+            `, ${result.skippedRecords} record(s) unchanged`
+        );
+
+        syncData = {
+            finishedAt: new Date(),
+            totalSynced: result.totalSynced,
+            duration: duration,
+            createdRecords: result.createdRecords,
+            updatedRecords: result.updatedRecords,
+            errorMessage: error ? error.message : null
+        };
+    } finally {
+        syncInProgress = false;
     }
 
-    const duration = performance.now() - start;
-    console.log(
-        `Duration: ${(duration / 1000).toFixed(2)} seconds` +
-        `, ${result.skippedRecords} record(s) unchanged`
-    );
-
-    const syncData = {
-        finishedAt: new Date(),
-        totalSynced: result.totalSynced,
-        duration: duration,
-        createdRecords: result.createdRecords,
-        updatedRecords: result.updatedRecords,
-        errorMessage: error ? error.message : null
-    }
     await sendMetrics(syncData);
     await telegramBot.notifySyncResult(syncData);
 
