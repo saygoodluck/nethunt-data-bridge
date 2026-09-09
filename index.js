@@ -59,7 +59,18 @@ const dbServer = {
 // Base64 first: env editors mangle the newlines a PEM key needs.
 const readPrivateKey = () => {
     if (process.env.SSH_PRIVATE_KEY_B64) {
-        return Buffer.from(process.env.SSH_PRIVATE_KEY_B64, 'base64');
+        // environment editors like to add surrounding quotes and trailing
+        // whitespace; base64 decoding turns either into an unparsable key
+        const encoded = process.env.SSH_PRIVATE_KEY_B64.trim().replace(/^["']|["']$/g, '');
+        const key = Buffer.from(encoded, 'base64');
+        if (!key.includes('PRIVATE KEY')) {
+            throw new Error(
+                'SSH_PRIVATE_KEY_B64 does not decode to a private key ' +
+                `(got ${key.length} bytes starting "${key.subarray(0, 24).toString().trim()}"). ` +
+                'Encode the private key, not the .pub, with: base64 -w0 ~/.ssh/id_ed25519'
+            );
+        }
+        return key;
     }
     if (process.env.SSH_PRIVATE_KEY) {
         return process.env.SSH_PRIVATE_KEY;
