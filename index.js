@@ -1131,7 +1131,10 @@ const clickHouseQuery = `
            any(t.TotalDeposit) as TotalDeposit,
            any(t.TotalWithdraw) as TotalWithdraw
     FROM UserHistory uh
-             JOIN CountriesNew c ON c.ID = uh.CountryID
+             -- LEFT, not INNER: 102 users carry a CountryID that is missing from
+             -- CountriesNew, and an inner join dropped them from the sync
+             -- entirely -- invisibly, since they simply never appeared.
+             LEFT JOIN CountriesNew c ON c.ID = uh.CountryID
              LEFT JOIN (SELECT UserID,
                                sum(Deposit) / 100  AS TotalDeposit,
                                sum(Withdraw) / 100 AS TotalWithdraw
@@ -1147,6 +1150,7 @@ const clickHouseQuery = `
                         WHERE UserID IN (SELECT UserID
                                          FROM UserHistory
                                          WHERE LastUpdated > toDateTime({since: UInt32})
+                                           AND RecordDate >= toDate(toDateTime({since: UInt32}))
                                            AND UserID < {cursor: UInt64}
                                          GROUP BY UserID
                                          ORDER BY UserID DESC
@@ -1156,6 +1160,12 @@ const clickHouseQuery = `
     -- the ones before it, so page 1300 cost as much as the whole table; a UserID
     -- bound prunes on the primary key instead, making every page cost the same.
     WHERE uh.LastUpdated > toDateTime({since: UInt32})
+      -- The table is partitioned by toYYYYMM(RecordDate) while LastUpdated is
+      -- not in any key, so without this every partition is read. A snapshot is
+      -- never recorded before the update it describes -- verified against
+      -- production, where no row has RecordDate < toDate(LastUpdated) -- so this
+      -- excludes nothing and lets whole partitions be skipped.
+      AND uh.RecordDate >= toDate(toDateTime({since: UInt32}))
       AND uh.UserID < {cursor: UInt64}
     GROUP BY uh.UserID
     ORDER BY uh.UserID DESC

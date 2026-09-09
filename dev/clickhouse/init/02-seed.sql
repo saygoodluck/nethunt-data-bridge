@@ -19,7 +19,9 @@ SELECT
     toUInt8(UserID % 2)                                     AS PhoneVerified,
     if(UserID % 2 = 0, 'Male', 'Female')                    AS Gender,
     arrayElement(['en', 'pl', 'uk', 'de'], toInt32(UserID % 4) + 1)  AS Language,
-    toUInt32(UserID % 5) + 1                                AS CountryID,
+    -- UserID 7 points at a country that does not exist in CountriesNew, the
+    -- same shape as the 102 production users an inner join silently dropped
+    if(UserID = 7, 9999, toUInt32(UserID % 5) + 1)          AS CountryID,
     if(number % 3 = 2, arrayElement(['Warsaw', 'Kyiv', 'Berlin', 'Toronto'], toInt32(UserID % 4) + 1), 'STALE-City') AS City,
     'Europe/Warsaw'                                         AS Timezone,
     now() - INTERVAL toUInt32(UserID % 48) HOUR             AS LastCreditDate,
@@ -28,6 +30,7 @@ SELECT
     toUInt8(if(UserID % 50 = 0, 1, 0))                      AS PEP,
     toUInt8(if(UserID % 7 = 0, 0, 1))                       AS Status,
     now() - INTERVAL (2 - toUInt32(number % 3)) DAY         AS RecordTime,
+    toDate(RecordTime)                                      AS RecordDate,
     -- users 1..180 are "recently changed", the rest must be filtered out
     if(UserID <= 180, now() - INTERVAL toUInt32(UserID % 30) MINUTE, now() - INTERVAL 5 DAY) AS LastUpdated,
     -- every branch of the DateOfBirth expression gets a case here:

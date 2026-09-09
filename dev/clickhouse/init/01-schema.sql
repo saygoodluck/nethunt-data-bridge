@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS analytics.UserHistory
     Status           UInt8,
     -- argMax(..., RecordTime) picks the newest revision of every field
     RecordTime       DateTime,
+    -- the table is partitioned on this in production, which is what lets the
+    -- sync window skip partitions instead of reading everything
+    RecordDate       Date,
     -- the sync window filters on this
     LastUpdated      DateTime,
     -- two generations of the same field, as in production: the Date32 column is
@@ -34,7 +37,8 @@ CREATE TABLE IF NOT EXISTS analytics.UserHistory
     DateOfBirthNew   Date32
 )
 ENGINE = MergeTree
-ORDER BY (UserID, RecordTime);
+PARTITION BY toYYYYMM(RecordDate)
+ORDER BY (UserID, RecordDate);
 
 CREATE TABLE IF NOT EXISTS analytics.CountriesNew
 (
