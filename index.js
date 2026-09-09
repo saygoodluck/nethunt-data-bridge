@@ -832,9 +832,12 @@ async function processRecord(record, absent = new Set()) {
         await redisClient.set(hashKey, hash, {EX: appConfig.cacheTtlSeconds});
         return {action: 'created'};
     } catch (err) {
+        // The body is where NetHunt explains itself; a status code and a stack
+        // trace through axios say nothing about what it objected to.
         console.error(`Error processing ${record.FundistUserID}:`, {
-            message: err.message,
-            stack: err.stack
+            status: err.response?.status,
+            body: err.response?.data,
+            message: err.message
         });
         throw err;
     }
