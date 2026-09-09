@@ -62,7 +62,18 @@ const readPrivateKey = () => {
         // environment editors like to add surrounding quotes and trailing
         // whitespace; base64 decoding turns either into an unparsable key
         const encoded = process.env.SSH_PRIVATE_KEY_B64.trim().replace(/^["']|["']$/g, '');
-        const key = Buffer.from(encoded, 'base64');
+        let key = Buffer.from(encoded, 'base64');
+
+        // `base64 -w0` prints no trailing newline, so a copy-paste easily picks
+        // up the shell prompt after it. Those characters are largely valid
+        // base64, so they decode into bytes appended to the key rather than
+        // being ignored -- cut at the end marker instead of trusting the length.
+        const marker = '-----END OPENSSH PRIVATE KEY-----';
+        const end = key.indexOf(marker);
+        if (end !== -1) {
+            key = key.subarray(0, end + marker.length + 1);
+        }
+
         if (!key.includes('PRIVATE KEY')) {
             throw new Error(
                 'SSH_PRIVATE_KEY_B64 does not decode to a private key ' +
