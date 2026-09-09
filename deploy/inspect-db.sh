@@ -181,6 +181,17 @@ if [[ $RUN_TIMING -eq 1 ]]; then
         GROUP BY uh.UserID ORDER BY uh.UserID DESC LIMIT 100)"
 
     echo
+    note "the hourly sync window, with and without the RecordDate bound:"
+    HOUR=$(( $(date +%s) - 3600 ))
+    timed "no RecordDate bound" "SELECT count() FROM (SELECT uh.UserID FROM UserHistory uh
+        WHERE uh.LastUpdated > toDateTime(${HOUR})
+        GROUP BY uh.UserID)"
+    timed "bounded by RecordDate" "SELECT count() FROM (SELECT uh.UserID FROM UserHistory uh
+        WHERE uh.LastUpdated > toDateTime(${HOUR})
+          AND uh.RecordDate >= toDate(toDateTime(${HOUR}))
+        GROUP BY uh.UserID)"
+
+    echo
     note "the Turnovers join, bounded by the window versus by the page:"
     timed "join bounded by the window" "SELECT count() FROM (SELECT uh.UserID FROM UserHistory uh
         LEFT JOIN (SELECT UserID, sum(Deposit)/100 d FROM Turnovers
