@@ -70,7 +70,19 @@ const readPrivateKey = () => {
     const resolved = keyPath.startsWith('~/')
         ? path.join(os.homedir(), keyPath.slice(2))
         : keyPath;
-    return fs.readFileSync(resolved);
+
+    try {
+        return fs.readFileSync(resolved);
+    } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+        // a bare ENOENT says nothing about the three ways to supply the key
+        throw new Error(
+            `No SSH key at ${resolved}. Either set SSH_PRIVATE_KEY_B64 to the ` +
+            `base64 of the private key (base64 -w0 ~/.ssh/id_ed25519), which needs ` +
+            `no file at all, or mount the key at that path and make sure uid 1000 ` +
+            `can read it.`
+        );
+    }
 };
 
 const buildTunnelConfig = () => ({
