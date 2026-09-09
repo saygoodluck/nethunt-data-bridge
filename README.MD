@@ -194,10 +194,12 @@ The basic-auth username is the account's email address.
 Two folders are needed. Field names must match exactly: the payload is built
 from these keys, and records are looked up with `query=FundistUserID=<id>`.
 
-**Records folder** (`NETHUNT_FOLDER_ID`) — the 20 fields the sync owns, from
-`mapRecordFields()`:
+**Records folder** (`NETHUNT_FOLDER_ID`) — the 21 fields the sync owns, from
+`mapRecordFields()`. `Name` is created by NetHunt with every folder and is the
+record title shown in lists and cards; the sync fills it from the first and last
+name, falling back to the login, so records do not read as blank in the UI:
 
-`FundistUserID` and `TotalDeposit`/`TotalWithdraw` as Number, `Email` as Email,
+`Name` as Text, `FundistUserID` and `TotalDeposit`/`TotalWithdraw` as Number, `Email` as Email,
 `PhoneNumber` as Phone, everything else as Text — `Login`, `FirstName`,
 `LastName`, `PhoneVerified`, `DateOfBirth`, `Gender`, `Language`, `Country`,
 `City`, `Timezone`, `LastCreditDate`, `RegistrationDate`, `LastLoginDate`,
@@ -215,11 +217,11 @@ out the sync window, and a Date field can come back without the time of day.
 
 ### Sharing the records folder with the team
 
-The sync sends only its own 20 fields, and NetHunt leaves fields absent from an
+The sync sends only its own 21 fields, and NetHunt leaves fields absent from an
 update alone — so any field the team adds, such as `Comment`, is safe by
 construction and needs no code change.
 
-The 20 synced fields should be made read-only for everyone else through **Limit
+The 21 synced fields should be made read-only for everyone else through **Limit
 field editing** on each field. Without that, a manual correction survives until
 the next run and then silently disappears, which is worse than not being able to
 make it. **Leave the integration account among those allowed to edit**, or the
@@ -235,12 +237,13 @@ sync loses the right to write its own fields.
 No tunnel and no whitelisted IP required — unlike ClickHouse, the NetHunt API is
 reachable from anywhere, so this runs on a laptop.
 
-`--probe` settles three things the documentation does not: whether `finishedAt`
-survives a round trip unchanged, whether `new-record` returns the newest record
-first, and which query syntax `find-record` accepts. That last one matters: the
-code sends `Field=Value` while the documented example uses `Field:Value`, and if
-only the latter worked, every sync would treat all users as new and create
-duplicates. Delete the probe record afterwards.
+`--probe` settles three things the documentation does not, all three confirmed
+against the live tenant: `finishedAt` survives the round trip unchanged,
+`new-record` does return the newest record first, and `find-record` accepts the
+`Field=Value` syntax the code sends. Delete the probe record afterwards.
+
+Note that `folder-field` returns field names only — NetHunt does not expose
+field types through this endpoint, so the check verifies names, not types.
 
 ## Deployment (Dokploy)
 

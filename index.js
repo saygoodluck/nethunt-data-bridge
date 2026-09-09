@@ -644,8 +644,16 @@ async function updateNetHuntRecord(recordId, data) {
     }
 }
 
+// NetHunt's built-in Name field is the record title shown in lists and cards.
+// Without it every record reads as blank in the UI, whatever else it holds.
+function displayName(record) {
+    const full = [record.FirstName, record.LastName].filter(Boolean).join(' ').trim();
+    return full || record.Login || String(record.FundistUserID);
+}
+
 function mapRecordFields(record) {
     return {
+        Name: displayName(record),
         FundistUserID: record.FundistUserID,
         Login: record.Login,
         FirstName: record.FirstName,

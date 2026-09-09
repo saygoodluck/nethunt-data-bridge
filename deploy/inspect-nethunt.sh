@@ -129,7 +129,7 @@ PY
 
 # --- 3. field schemas -------------------------------------------------------
 # the contract: index.js builds its payload from exactly these names
-RECORD_FIELDS="FundistUserID Login FirstName LastName Email PhoneNumber \
+RECORD_FIELDS="Name FundistUserID Login FirstName LastName Email PhoneNumber \
 PhoneVerified DateOfBirth Gender Language Country City Timezone \
 LastCreditDate RegistrationDate LastLoginDate PEP AccountStatus \
 TotalDeposit TotalWithdraw"
@@ -176,11 +176,13 @@ def name_of(f):
     return None
 
 def type_of(f):
+    # folder-field returns only {"name": ...} in practice; the type is simply
+    # not exposed, so say nothing rather than printing a bogus placeholder
     if isinstance(f, dict):
         for k in ('type', 'fieldType', 'dataType'):
             if f.get(k):
                 return str(f[k])
-    return '?'
+    return ''
 
 if isinstance(schema, dict):
     schema = schema.get('fields') or schema.get('folderFields') or []
@@ -197,11 +199,11 @@ extra = [f for f in actual if f not in expected]
 
 for f in expected:
     if f in actual:
-        print(f'OK\t{f} ({actual[f]})')
+        print(f'OK\t{f}' + (f' ({actual[f]})' if actual[f] else ''))
 for f in missing:
     print(f'MISSING\t{f}')
 for f in sorted(extra):
-    print(f'EXTRA\t{f} ({actual[f]})')
+    print(f'EXTRA\t{f}' + (f' ({actual[f]})' if actual[f] else ''))
 PY
     )
 

@@ -26,6 +26,8 @@ let nextId = 1;
 // Folder registry, shaped like the real tenant should be. Field names here are
 // the contract: index.js builds its payload from exactly these keys.
 const SYNCED_FIELDS = [
+    // NetHunt creates Name with every folder and uses it as the record title
+    ['Name', 'TEXT'],
     ['FundistUserID', 'NUMBER'], ['Login', 'TEXT'],
     ['FirstName', 'TEXT'], ['LastName', 'TEXT'],
     ['Email', 'EMAIL'], ['PhoneNumber', 'PHONE'],
@@ -47,6 +49,7 @@ const folders = {
     utils: {
         name: 'Sync metrics',
         fields: [
+            ['Name', 'TEXT'],
             ['finishedAt', 'TEXT'], ['totalSynced', 'NUMBER'],
             ['duration', 'NUMBER'], ['createdRecords', 'NUMBER'],
             ['updatedRecords', 'NUMBER'], ['errorMessage', 'TEXT']
