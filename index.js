@@ -442,8 +442,40 @@ app.get('/sync', authenticate, async (req, res) => {
         });
     }
 
+    // Optional overrides so a backfill needs no environment change and no
+    // redeploy, and leaves the schedule running with its usual window.
+    const options = {};
+
+    if (req.query.since !== undefined) {
+        const since = new Date(req.query.since);
+        if (Number.isNaN(since.getTime())) {
+            return res.status(400).json({
+                status: 'error',
+                message: `since is not a date: ${req.query.since}`
+            });
+        }
+        if (since.getTime() > Date.now()) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'since is in the future, which would select nothing'
+            });
+        }
+        options.since = since;
+    }
+
+    if (req.query.batchSize !== undefined) {
+        const batchSize = Number(req.query.batchSize);
+        if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 1000) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'batchSize must be a whole number between 1 and 1000'
+            });
+        }
+        options.batchSize = batchSize;
+    }
+
     try {
-        const result = await executeSync();
+        const result = await executeSync(options);
         res.json({
             status: 'success',
             message: 'Sync completed',
@@ -463,6 +495,16 @@ app.get('/sync', authenticate, async (req, res) => {
 // explain a connection problem instead of the container dying silently.
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
+}).on('error', (err) => {
+    // Without this a taken port throws a bare stack trace, and an older process
+    // keeps answering on it -- so the service looks healthy while serving code
+    // that is not the one just deployed.
+    if (err.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use; another instance is probably running`);
+    } else {
+        console.error('HTTP server failed:', err);
+    }
+    process.exit(1);
 });
 telegramBot.startPolling();
 telegramBot.notifyStartup().catch(console.error);
@@ -554,7 +596,7 @@ async function loadSchemaWithRetry() {
 // data, splitting the request allowance between runs that duplicate each other.
 let syncInProgress = false;
 
-async function executeSync() {
+async function executeSync(options = {}) {
     if (syncInProgress) {
         throw new Error('A sync is already running');
     }
@@ -570,7 +612,7 @@ async function executeSync() {
     // would stop every future run, which is worse than the overlap it prevents
     try {
         try {
-            result = await syncRecords();
+            result = await syncRecords(options);
         } catch (err) {
             error = err;
             console.error('Sync error:', err);
@@ -602,12 +644,17 @@ async function executeSync() {
     return syncData;
 }
 
-async function syncRecords() {
-    let offset = 0;
+async function syncRecords({since: explicitSince, batchSize: explicitBatchSize} = {}) {
+    // Comfortably above any real UserID and still exact in JS, so the first page
+    // has no upper bound in practice. It is below the true UInt64 maximum: ids
+    // past 2^53 would need max(UserID) to be read instead.
+    let cursor = Number.MAX_SAFE_INTEGER;
     let totalSynced = 0;
     let createdRecords = 0;
     let updatedRecords = 0;
     let skippedRecords = 0;
+
+    const batchSize = explicitBatchSize || appConfig.batchSize;
 
     try {
         console.log('Starting sync...');
@@ -615,9 +662,21 @@ async function syncRecords() {
 
         // the utils folder is empty until the first run ever writes metrics into it
         const {finishedAt} = await getLastSyncTime() ?? {};
-        const interval = calculateInterval(finishedAt);
+
+        // Pinned once, not re-evaluated per page: with now() in the query the
+        // window would slide during a long run, and a user could land in two
+        // pages or in none.
+        const since = explicitSince
+            ? Math.floor(explicitSince.getTime() / 1000)
+            : Math.floor(Date.now() / 1000) - calculateInterval(finishedAt) * 60;
+
+        console.log(
+            `Window starts ${new Date(since * 1000).toISOString()}` +
+            `, page size ${batchSize}`
+        );
+
         while (true) {
-            const records = await fetchRecordsBatch(offset, interval);
+            const records = await fetchRecordsBatch(cursor, since, batchSize);
             if (records.length === 0) break;
 
             // one lookup for the whole page, before it is split for concurrency
@@ -635,7 +694,14 @@ async function syncRecords() {
                 logProgress(totalSynced, createdRecords, updatedRecords, skippedRecords);
             }
 
-            offset += appConfig.batchSize;
+            // the page is ordered descending, so its last row carries the lowest id
+            const next = Number(records[records.length - 1].FundistUserID);
+            if (!(next < cursor)) {
+                // with OFFSET a mistake here cost extra work; with a cursor it
+                // is an endless loop that would burn the whole request allowance
+                throw new Error(`Pagination stalled at UserID ${cursor}`);
+            }
+            cursor = next;
         }
 
         console.log(`\nSync completed. ${requestsMade - requestsAtStart} NetHunt requests used.`);
@@ -695,13 +761,13 @@ async function sendMetrics(data) {
     }
 }
 
-async function fetchRecordsBatch(offset, interval) {
+async function fetchRecordsBatch(cursor, since, batchSize) {
     // errors propagate on purpose: an empty array here would end the loop and
     // report the sync as successful
     const result = await clickhouseClient.query({
         query: clickHouseQuery,
         format: 'JSONEachRow',
-        query_params: {batchSize: appConfig.batchSize, offset: offset, interval: interval}
+        query_params: {batchSize, cursor, since}
     });
     return await result.json();
 }
@@ -1070,18 +1136,29 @@ const clickHouseQuery = `
                                sum(Deposit) / 100  AS TotalDeposit,
                                sum(Withdraw) / 100 AS TotalWithdraw
                         FROM Turnovers
-                        -- Without this the whole table is aggregated on every
-                        -- page, since ClickHouse does not push the outer filter
-                        -- into a joined subquery. Only users in the sync window
-                        -- can appear in the result, so restricting it here
-                        -- changes nothing but the work done.
+                        -- Restricted to the users of this page, not of the whole
+                        -- window. ClickHouse does not push the outer filter into
+                        -- a joined subquery, and on a wide window the window
+                        -- filter stops excluding anything -- which meant reading
+                        -- the entire table again for every page.
+                        -- GROUP BY is required: without it LIMIT counts history
+                        -- rows rather than users, and this set would drift out
+                        -- of step with the outer query.
                         WHERE UserID IN (SELECT UserID
                                          FROM UserHistory
-                                         WHERE LastUpdated > now() - INTERVAL {interval: UInt32} MINUTE)
+                                         WHERE LastUpdated > toDateTime({since: UInt32})
+                                           AND UserID < {cursor: UInt64}
+                                         GROUP BY UserID
+                                         ORDER BY UserID DESC
+                                         LIMIT {batchSize: UInt32})
                         GROUP BY UserID) t ON uh.UserID = t.UserID
-    WHERE uh.LastUpdated > now() - INTERVAL {interval: UInt32} MINUTE
+    -- Keyset paging. OFFSET made ClickHouse aggregate every group and discard
+    -- the ones before it, so page 1300 cost as much as the whole table; a UserID
+    -- bound prunes on the primary key instead, making every page cost the same.
+    WHERE uh.LastUpdated > toDateTime({since: UInt32})
+      AND uh.UserID < {cursor: UInt64}
     GROUP BY uh.UserID
     ORDER BY uh.UserID DESC
-    LIMIT {batchSize: UInt32} OFFSET {offset: UInt32}
+    LIMIT {batchSize: UInt32}
 `;
 // @formatter:on
