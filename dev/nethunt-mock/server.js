@@ -271,6 +271,18 @@ const server = http.createServer(async (req, res) => {
             const folderId = recordsPath[1];
             if (!folders[folderId]) return json(res, 404, {code: 'FOLDER_NOT_FOUND'});
             const body = await readBody(req);
+
+            // The real API answers 502 with a Java stack trace for an empty
+            // string on a text field, on any field, so the contour has to be
+            // just as strict or the defect returns unnoticed.
+            const empty = Object.entries(body.fields || {}).find(([, v]) => v === '');
+            if (empty) {
+                return json(res, 502, {
+                    error: 'UPSTREAM_ERROR',
+                    message: `Wrong value in column [${empty[0]}]`
+                });
+            }
+
             const now = Date.now();
             const id = `rec_${nextId++}`;
             records.set(id, {folderId, fields: {...body.fields}, createdAt: now, updatedAt: now});
@@ -299,6 +311,13 @@ const server = http.createServer(async (req, res) => {
             if (method === 'GET') return json(res, 200, shape(one[2], record));
 
             const body = await readBody(req);
+            const blank = Object.entries(body.fields || {}).find(([, v]) => v === '');
+            if (blank) {
+                return json(res, 502, {
+                    error: 'UPSTREAM_ERROR',
+                    message: `Wrong value in column [${blank[0]}]`
+                });
+            }
             // partial by nature: fields not named here keep their value
             Object.assign(record.fields, body.fields || {});
             record.updatedAt = Date.now();

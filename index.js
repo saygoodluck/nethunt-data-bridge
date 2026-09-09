@@ -932,15 +932,20 @@ function coerce(value, valueType) {
     return value;
 }
 
-// Turns a name-keyed object into the id-keyed payload v2 expects. Null values
-// are dropped rather than sent: there is nothing to clear on a new record.
+// Turns a name-keyed object into the id-keyed payload v2 expects.
+//
+// Empty values are omitted, not sent. NetHunt rejects an empty string on a text
+// field with a 502 and a Java stack trace rather than a validation error -- and
+// it is not fussy about which field, so one absent value used to fail the whole
+// record. The cost is that a value cleared upstream stays put in the CRM until
+// it is set to something again.
 function toFieldPayload(values, fields) {
     const payload = {};
     for (const [name, value] of Object.entries(values)) {
         const field = fields.get(name);
-        if (!field || value === null || value === undefined) continue;
+        if (!field || value === null || value === undefined || value === '') continue;
         const converted = coerce(value, field.valueType);
-        if (converted !== null && converted !== undefined) {
+        if (converted !== null && converted !== undefined && converted !== '') {
             payload[field.id] = converted;
         }
     }
@@ -1129,7 +1134,11 @@ const clickHouseQuery = `
            argMax(uh.LastCreditDate, uh.RecordTime) AS LastCreditDate,
            argMax(uh.RegistrationDate, uh.RecordTime) AS RegistrationDate,
            argMax(uh.LastLoginDate, uh.RecordTime) AS LastLoginDate,
-           if(argMax(uh.PEP, uh.RecordTime) = 1, 'PEP', '') AS PEP,
+           -- 'Not PEP' rather than an empty string: empty is rejected outright,
+           -- and omitting the field would leave the flag set forever on someone
+           -- who stopped being a PEP, which is the wrong way round for a
+           -- compliance marker. Follows the Verified/Unverified pattern above.
+           if(argMax(uh.PEP, uh.RecordTime) = 1, 'PEP', 'Not PEP') AS PEP,
            if(argMax(uh.Status, uh.RecordTime) = 1, 'Active', 'Inactive') AS AccountStatus,
            any(t.TotalDeposit) as TotalDeposit,
            any(t.TotalWithdraw) as TotalWithdraw

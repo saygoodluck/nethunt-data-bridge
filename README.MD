@@ -203,6 +203,16 @@ else as text — `Login`, `FirstName`, `LastName`, `Email`, `PhoneNumber`,
 `Timezone`, `LastCreditDate`, `RegistrationDate`, `LastLoginDate`, `PEP`,
 `AccountStatus`.
 
+Empty values are never sent. NetHunt rejects an empty string on a text field
+with `502 UPSTREAM_ERROR` and a Java stack trace rather than a validation error,
+and it does so for any field, so a single missing value used to fail the whole
+record. Fields with no value are omitted instead — which means a value cleared
+upstream stays in the CRM until it is set to something again.
+
+`PEP` is the exception: it always carries `PEP` or `Not PEP`. Omitting it would
+leave the flag set on someone who stopped being one, which is the wrong way
+round for a compliance marker.
+
 Dates are sent as `YYYY-MM-DD HH:MM:SS` strings, so those fields must be text.
 A real date field expects epoch milliseconds and would reject every write; the
 service refuses to start if it finds one, rather than failing per record.
