@@ -11,6 +11,7 @@
  * Plus a small admin surface for testing, which the real API does not have:
  *   GET    /__admin/state
  *   DELETE /__admin/records/:recordId   - simulate a record deleted in the CRM
+ *   POST   /__admin/records/:recordId/fields - simulate a manager editing a field
  *   POST   /__admin/reset
  */
 
@@ -21,6 +22,39 @@ const PORT = Number(process.env.PORT) || 3010;
 // recordId -> {folderId, fields}
 const records = new Map();
 let nextId = 1;
+
+// Folder registry, shaped like the real tenant should be. Field names here are
+// the contract: index.js builds its payload from exactly these keys.
+const SYNCED_FIELDS = [
+    ['FundistUserID', 'NUMBER'], ['Login', 'TEXT'],
+    ['FirstName', 'TEXT'], ['LastName', 'TEXT'],
+    ['Email', 'EMAIL'], ['PhoneNumber', 'PHONE'],
+    ['PhoneVerified', 'TEXT'], ['DateOfBirth', 'TEXT'],
+    ['Gender', 'TEXT'], ['Language', 'TEXT'],
+    ['Country', 'TEXT'], ['City', 'TEXT'], ['Timezone', 'TEXT'],
+    ['LastCreditDate', 'TEXT'], ['RegistrationDate', 'TEXT'],
+    ['LastLoginDate', 'TEXT'], ['PEP', 'TEXT'],
+    ['AccountStatus', 'TEXT'],
+    ['TotalDeposit', 'NUMBER'], ['TotalWithdraw', 'NUMBER']
+];
+
+const folders = {
+    users: {
+        name: 'Players',
+        // Comment is owned by managers; the sync never sends it
+        fields: [...SYNCED_FIELDS, ['Comment', 'TEXT']]
+    },
+    utils: {
+        name: 'Sync metrics',
+        fields: [
+            ['finishedAt', 'TEXT'], ['totalSynced', 'NUMBER'],
+            ['duration', 'NUMBER'], ['createdRecords', 'NUMBER'],
+            ['updatedRecords', 'NUMBER'], ['errorMessage', 'TEXT']
+        ]
+    }
+};
+
+const folderList = () => Object.entries(folders).map(([id, f]) => ({id, name: f.name}));
 
 const json = (res, status, body) => {
     const payload = JSON.stringify(body);
@@ -42,10 +76,11 @@ const readBody = (req) => new Promise((resolve, reject) => {
     req.on('error', reject);
 });
 
-// "FundistUserID=123" -> "123"
+// "FundistUserID=123" or "Name:Doe" -> {field, value}. Both separators are
+// accepted because which one the real API wants is still an open question.
 const parseQuery = (query) => {
-    const match = /^FundistUserID=(.+)$/.exec(query || '');
-    return match ? match[1] : null;
+    const match = /^([A-Za-z0-9_]+)[=:]([\s\S]*)$/.exec(query || '');
+    return match ? {field: match[1], value: match[2]} : null;
 };
 
 const applyFieldActions = (fields, fieldActions) => {
@@ -82,6 +117,17 @@ const server = http.createServer(async (req, res) => {
             const existed = records.delete(id);
             console.log(`[admin] delete ${id}: ${existed ? 'removed' : 'not found'}`);
             return json(res, existed ? 200 : 404, {deleted: existed});
+        }
+
+        // a manager editing a field by hand, bypassing the sync entirely
+        const adminFields = /^\/__admin\/records\/([^/]+)\/fields$/.exec(path);
+        if (adminFields && method === 'POST') {
+            const record = records.get(adminFields[1]);
+            if (!record) return json(res, 404, {error: 'Record not found'});
+            const body = await readBody(req);
+            Object.assign(record.fields, body.fields || {});
+            console.log(`[admin] manager edited ${adminFields[1]}: ${Object.keys(body.fields || {}).join(', ')}`);
+            return json(res, 200, {fields: record.fields});
         }
 
         if (path === '/__admin/reset' && method === 'POST') {
@@ -128,6 +174,17 @@ const server = http.createServer(async (req, res) => {
         }
 
         // --- zapier api ------------------------------------------------------
+        if (/^\/api\/v1\/zapier\/triggers\/(readable|writable)-folder$/.test(path) && method === 'GET') {
+            return json(res, 200, folderList());
+        }
+
+        const folderField = /^\/api\/v1\/zapier\/triggers\/folder-field\/(.+)$/.exec(path);
+        if (folderField && method === 'GET') {
+            const folder = folders[folderField[1]];
+            if (!folder) return json(res, 404, {error: 'Folder not found'});
+            return json(res, 200, folder.fields.map(([name, type]) => ({name, type})));
+        }
+
         const trigger = /^\/api\/v1\/zapier\/triggers\/new-record\/(.+)$/.exec(path);
         if (trigger && method === 'GET') {
             const folderId = trigger[1];
@@ -141,10 +198,11 @@ const server = http.createServer(async (req, res) => {
         const search = /^\/api\/v1\/zapier\/searches\/find-record\/(.+)$/.exec(path);
         if (search && method === 'GET') {
             const folderId = search[1];
-            const userId = parseQuery(url.searchParams.get('query'));
+            const parsed = parseQuery(url.searchParams.get('query'));
+            if (!parsed) return json(res, 200, []);
             const hits = [...records.entries()]
                 .filter(([, r]) => r.folderId === folderId
-                    && String(r.fields.FundistUserID) === String(userId))
+                    && String(r.fields[parsed.field] ?? '') === String(parsed.value))
                 .map(([id, r]) => ({id, fields: r.fields}));
             return json(res, 200, hits);
         }

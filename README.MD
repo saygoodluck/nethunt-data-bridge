@@ -171,6 +171,77 @@ curl -X POST http://localhost:3010/__admin/telegram/send-command \
      -H 'Content-Type: application/json' -d '{"text":"/status"}'
 ```
 
+## NetHunt setup
+
+### The API key
+
+NetHunt issues two kinds of key in two different places, and only one of them
+works here:
+
+| Settings section | Key for |
+|---|---|
+| API & MCP | the v2 API |
+| Apps and other integrations → **API LEGACY** | the v1 API |
+
+The service calls `/api/v1/zapier/...`, so it needs the **LEGACY** key. A v2 key
+is rejected with `Your email address or API key does not appear to be valid` —
+the same message you get for a typo, so this is worth checking first.
+
+The basic-auth username is the account's email address.
+
+### Folders
+
+Two folders are needed. Field names must match exactly: the payload is built
+from these keys, and records are looked up with `query=FundistUserID=<id>`.
+
+**Records folder** (`NETHUNT_FOLDER_ID`) — the 20 fields the sync owns, from
+`mapRecordFields()`:
+
+`FundistUserID` and `TotalDeposit`/`TotalWithdraw` as Number, `Email` as Email,
+`PhoneNumber` as Phone, everything else as Text — `Login`, `FirstName`,
+`LastName`, `PhoneVerified`, `DateOfBirth`, `Gender`, `Language`, `Country`,
+`City`, `Timezone`, `LastCreditDate`, `RegistrationDate`, `LastLoginDate`,
+`PEP`, `AccountStatus`.
+
+Dates arrive as `YYYY-MM-DD HH:MM:SS` strings and the fields with a fixed set of
+values can be empty, so Text is the safe starting point for both.
+
+**Utils folder** (`NETHUNT_UTILS_FOLDER_ID`) — `finishedAt` and `errorMessage`
+as Text, `totalSynced`, `duration`, `createdRecords`, `updatedRecords` as
+Number.
+
+`finishedAt` must be Text: it is read back and parsed with `new Date()` to work
+out the sync window, and a Date field can come back without the time of day.
+
+### Sharing the records folder with the team
+
+The sync sends only its own 20 fields, and NetHunt leaves fields absent from an
+update alone — so any field the team adds, such as `Comment`, is safe by
+construction and needs no code change.
+
+The 20 synced fields should be made read-only for everyone else through **Limit
+field editing** on each field. Without that, a manual correction survives until
+the next run and then silently disappears, which is worse than not being able to
+make it. **Leave the integration account among those allowed to edit**, or the
+sync loses the right to write its own fields.
+
+### Verifying
+
+```bash
+./deploy/inspect-nethunt.sh          # credentials, folder ids, field schemas
+./deploy/inspect-nethunt.sh --probe  # also writes one record into the utils folder
+```
+
+No tunnel and no whitelisted IP required — unlike ClickHouse, the NetHunt API is
+reachable from anywhere, so this runs on a laptop.
+
+`--probe` settles three things the documentation does not: whether `finishedAt`
+survives a round trip unchanged, whether `new-record` returns the newest record
+first, and which query syntax `find-record` accepts. That last one matters: the
+code sends `Field=Value` while the documented example uses `Field:Value`, and if
+only the latter worked, every sync would treat all users as new and create
+duplicates. Delete the probe record afterwards.
+
 ## Deployment (Dokploy)
 
 The stack is deployed as a Dokploy **Compose** application from
