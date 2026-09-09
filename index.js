@@ -329,6 +329,8 @@ async function connectWithRetry() {
         try {
             await (skipSSHTunnel ? connectDirectly() : setupSSHTunnel());
             clickhouseReady = true;
+            // success was silent before: the absence of an error was the only sign
+            console.log(`ClickHouse connected (${dbServer.database} on ${dbServer.host})`);
 
             if (alerted) {
                 await telegramBot.sendAlert(
