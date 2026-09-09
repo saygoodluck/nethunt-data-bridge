@@ -1,9 +1,18 @@
 # Production stack, deployed by Dokploy (Compose type).
 #
-# Environment comes from Dokploy, not from a file in the repo. Required there:
+# Environment comes from the .env file Dokploy writes next to this compose file
+# from the application's Environment tab -- NOT from any .env in a clone of the
+# repository. `env_file` passes it through wholesale on purpose: enumerating the
+# variables here meant this file had to be edited every time one was added, and
+# a forgotten one arrived as an empty string rather than as an error.
+#
+# Required there:
 #   CLICKHOUSE_HOST/PORT/USER/PASSWORD/DATABASE
-#   SSH_HOST/SSH_PORT/SSH_USER  + SSH_PRIVATE_KEY_B64
-#   NETHUNT_USER/NETHUNT_API_KEY/NETHUNT_FOLDER_ID/NETHUNT_UTILS_FOLDER_ID
+#   SSH_HOST/SSH_PORT/SSH_USER  + SSH_PRIVATE_KEY_B64 (or a mounted key, below)
+#   NETHUNT_API_TOKEN, NETHUNT_FOLDER_ID, NETHUNT_UTILS_FOLDER_ID
+#   SYNC_API_KEY
+# Optional: TELEGRAM_*, NOTIFY_*, DAILY_REPORT_AT, BATCH_SIZE,
+#   MAX_CONCURRENT_REQUESTS, SYNC_INTERVAL_MINUTES, CACHE_TTL_SECONDS
 #
 # Generate the key value with:  base64 -i ~/.ssh/id_ed25519 | tr -d '\n'
 
@@ -11,35 +20,14 @@ services:
   app:
     build: .
     restart: unless-stopped
+    env_file:
+      - .env
+    # only what must not come from the environment file
     environment:
       PORT: 3000
-      # Redis is a sibling container, not localhost
+      # Redis is a sibling container, never localhost
       REDIS_URL: redis://redis:6379
-      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
-      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
-      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE}
-      SSH_HOST: ${SSH_HOST}
-      SSH_PORT: ${SSH_PORT}
-      SSH_USER: ${SSH_USER}
-      SSH_PRIVATE_KEY_B64: ${SSH_PRIVATE_KEY_B64:-}
-      SSH_KEY_PATH: ${SSH_KEY_PATH:-}
-      NETHUNT_USER: ${NETHUNT_USER}
-      NETHUNT_API_KEY: ${NETHUNT_API_KEY}
-      NETHUNT_FOLDER_ID: ${NETHUNT_FOLDER_ID}
-      NETHUNT_UTILS_FOLDER_ID: ${NETHUNT_UTILS_FOLDER_ID}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-      TELEGRAM_ADMINS: ${TELEGRAM_ADMINS:-}
-      NOTIFY_EACH_SYNC: ${NOTIFY_EACH_SYNC:-0}
-      NOTIFY_ERRORS: ${NOTIFY_ERRORS:-1}
-      NOTIFY_STARTUP: ${NOTIFY_STARTUP:-1}
-      DAILY_REPORT_AT: ${DAILY_REPORT_AT:-}
-      BATCH_SIZE: ${BATCH_SIZE:-100}
-      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-5}
-      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-60}
-      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-1209600}
+
     # The key can also be mounted instead of pasted into the environment, which
     # suits a key that already lives on the server. Uncomment, point the source
     # at the real path, and set SSH_KEY_PATH=/home/node/.ssh/id_ed25519.
