@@ -243,6 +243,52 @@ as text or a date field that would reject every write. `--probe` confirms that
 listing records returns them oldest first, and the sync window depends on
 getting the newest. Delete the probe record afterwards.
 
+## Request budget
+
+NetHunt bills by requests per minute. `NETHUNT_RATE_LIMIT` keeps the service
+just under the plan's allowance, because a refused request costs the same quota
+as a served one — being throttled locally is strictly better than collecting
+429s.
+
+Each record costs **one request** (the write). Lookups are batched: a page of
+100 users is resolved with a single filter built from an `_or` of equalities,
+since a number field has no `_any` operator. Records whose payload has not
+changed since the last run cost nothing at all — the payload is hashed into
+Redis and compared before writing.
+
+Measured on the contour, for 180 records:
+
+| Situation | Requests |
+|---|---|
+| Empty CRM, all records new | 184 |
+| Second run, nothing changed | 2 |
+| Redis cache lost, CRM already populated | 184 |
+
+### Steady state
+
+At roughly twenty changed users an hour, the sync spends about twenty requests
+an hour — a fraction of a percent of a 100/minute plan. The limit is not a
+concern for ongoing operation.
+
+### Backfilling existing users
+
+Loading a large existing user base is a different matter, since each user costs
+one create that cannot be batched:
+
+| Users | at 100/min | at 600/min |
+|---|---|---|
+| 100 000 | ~17 h | ~3 h |
+| 500 000 | ~3.5 days | ~14 h |
+| 1 000 000 | ~7 days | ~28 h |
+
+Widen the window with `SYNC_INTERVAL_MINUTES` to backfill, and raise
+`NETHUNT_RATE_LIMIT` to match a temporarily upgraded plan.
+
+An interrupted backfill is cheap to resume: users already written are skipped on
+the payload hash, so a restarted run passes over them at Redis speed and costs
+no NetHunt requests. Losing the Redis volume is what makes a resume expensive —
+the hashes go with it, and every record is rewritten.
+
 ## Deployment (Dokploy)
 
 The stack is deployed as a Dokploy **Compose** application from

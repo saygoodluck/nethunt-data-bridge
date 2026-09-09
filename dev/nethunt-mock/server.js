@@ -72,6 +72,9 @@ const fieldByName = (folderId, name) =>
 const records = new Map();
 let nextId = 1;
 
+// counts every v2 call, so tests can show what a change costs in requests
+let apiCalls = 0;
+
 const sentMessages = [];
 let pendingUpdates = [];
 let updateId = 1;
@@ -101,8 +104,12 @@ const shape = (id, r) => ({
     fields: r.fields
 });
 
-// only what index.js actually sends: bare equality and {_exists: true}
+// what index.js actually sends: bare equality, {_exists: true}, and an _or of
+// equalities used to look a whole page of users up in one request
 const matches = (record, filter) => Object.entries(filter || {}).every(([key, cond]) => {
+    if (key === '_or') return cond.some(sub => matches(record, sub));
+    if (key === '_and') return cond.every(sub => matches(record, sub));
+
     const value = record.fields[key];
     if (cond && typeof cond === 'object') {
         if ('_exists' in cond) return value !== undefined && value !== '';
@@ -119,6 +126,12 @@ const server = http.createServer(async (req, res) => {
 
     try {
         // --- admin -----------------------------------------------------------
+        if (path === '/__admin/calls' && method === 'GET') {
+            const value = apiCalls;
+            if (url.searchParams.get('reset') === '1') apiCalls = 0;
+            return json(res, 200, {apiCalls: value});
+        }
+
         if (path === '/__admin/state' && method === 'GET') {
             return json(res, 200, {
                 count: records.size,
@@ -211,6 +224,7 @@ const server = http.createServer(async (req, res) => {
 
         // --- nethunt v2 ------------------------------------------------------
         if (path.startsWith('/api/v2/')) {
+            apiCalls++;
             if (!/^Bearer\s+\S+/.test(req.headers.authorization || '')) {
                 return json(res, 401, {code: 'UNAUTHORIZED', message: 'missing bearer token'});
             }

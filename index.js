@@ -4,6 +4,7 @@ import {createClient as createRedisClient} from 'redis';
 import express from 'express';
 import cron from 'node-cron';
 import axios from 'axios';
+import crypto from 'node:crypto';
 
 import {createTelegramBot} from './telegram.js';
 
@@ -181,7 +182,42 @@ const DATE_LIKE_FIELDS = [
     'DateOfBirth', 'LastCreditDate', 'RegistrationDate', 'LastLoginDate'
 ];
 
+// NetHunt bills by requests per minute and answers 429 past the allowance.
+// Staying under it locally is far better than being rejected: a refused request
+// costs the same quota as a served one.
+const rateLimit = {
+    perMinute: Number(process.env.NETHUNT_RATE_LIMIT) || 90,
+    // Bucket capacity, kept well below the rate on purpose. A bucket as deep as
+    // the rate lets a full burst land immediately and then refill inside the
+    // same minute, so a 60-second window can carry twice the allowance -- which
+    // is exactly what a hard limit rejects.
+    burst: Number(process.env.NETHUNT_RATE_BURST) || 5
+};
+
+let tokens = rateLimit.burst;
+let lastRefill = Date.now();
+let requestsMade = 0;
+
+async function takeRequestSlot() {
+    while (true) {
+        const now = Date.now();
+        tokens = Math.min(
+            rateLimit.burst,
+            tokens + (now - lastRefill) * rateLimit.perMinute / 60000
+        );
+        lastRefill = now;
+
+        if (tokens >= 1) {
+            tokens -= 1;
+            requestsMade++;
+            return;
+        }
+        await sleep(Math.ceil((1 - tokens) * 60000 / rateLimit.perMinute));
+    }
+}
+
 async function netHunt(method, path, {body, params, timeout = 15000} = {}) {
+    await takeRequestSlot();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
     try {
@@ -506,7 +542,7 @@ async function loadSchemaWithRetry() {
 async function executeSync() {
     const start = performance.now();
     // a failed sync still reports: zeros plus the error, instead of blowing up here
-    let result = {totalSynced: 0, createdRecords: 0, updatedRecords: 0};
+    let result = {totalSynced: 0, createdRecords: 0, updatedRecords: 0, skippedRecords: 0};
     let error = null;
     try {
         result = await syncRecords();
@@ -516,7 +552,10 @@ async function executeSync() {
     }
 
     const duration = performance.now() - start;
-    console.log(`Duration: ${(duration / 1000).toFixed(2)} seconds`);
+    console.log(
+        `Duration: ${(duration / 1000).toFixed(2)} seconds` +
+        `, ${result.skippedRecords} record(s) unchanged`
+    );
 
     const syncData = {
         finishedAt: new Date(),
@@ -539,9 +578,11 @@ async function syncRecords() {
     let totalSynced = 0;
     let createdRecords = 0;
     let updatedRecords = 0;
+    let skippedRecords = 0;
 
     try {
         console.log('Starting sync...');
+        const requestsAtStart = requestsMade;
 
         // the utils folder is empty until the first run ever writes metrics into it
         const {finishedAt} = await getLastSyncTime() ?? {};
@@ -550,22 +591,26 @@ async function syncRecords() {
             const records = await fetchRecordsBatch(offset, interval);
             if (records.length === 0) break;
 
+            // one lookup for the whole page, before it is split for concurrency
+            const absent = await resolveKnownIds(records);
+
             const chunks = chunkArray(records, appConfig.maxConcurrentRequests);
 
             for (const chunk of chunks) {
-                const results = await processChunk(chunk);
+                const results = await processChunk(chunk, absent);
                 createdRecords += results.created;
                 updatedRecords += results.updated;
+                skippedRecords += results.skipped;
                 totalSynced += chunk.length;
 
-                logProgress(totalSynced, createdRecords, updatedRecords);
+                logProgress(totalSynced, createdRecords, updatedRecords, skippedRecords);
             }
 
             offset += appConfig.batchSize;
         }
 
-        console.log(`\nSync completed.`);
-        return {totalSynced, createdRecords, updatedRecords};
+        console.log(`\nSync completed. ${requestsMade - requestsAtStart} NetHunt requests used.`);
+        return {totalSynced, createdRecords, updatedRecords, skippedRecords};
     } catch (err) {
         console.error('Sync failed:', err);
         throw err;
@@ -632,32 +677,41 @@ async function fetchRecordsBatch(offset, interval) {
     return await result.json();
 }
 
-async function processChunk(chunk) {
+async function processChunk(chunk, absent = new Set()) {
     let created = 0;
     let updated = 0;
+    let skipped = 0;
 
     const results = await Promise.allSettled(
-        chunk.map(record => withRetry(() => processRecord(record), appConfig.retry))
+        chunk.map(record => withRetry(() => processRecord(record, absent), appConfig.retry))
     );
 
     for (const result of results) {
         if (result.status === 'fulfilled') {
             if (result.value.action === 'created') created++;
             if (result.value.action === 'updated') updated++;
+            if (result.value.action === 'unchanged') skipped++;
         } else {
             console.error('Record processing error:', result.reason);
         }
     }
 
-    return {created, updated};
+    return {created, updated, skipped};
 }
 
-async function processRecord(record) {
+async function processRecord(record, absent = new Set()) {
     try {
+        const hash = payloadHash(recordPayload(record));
+        const hashKey = `h:${record.FundistUserID}`;
+
         const cachedNetHuntUserId = await redisClient.get(record.FundistUserID);
         if (cachedNetHuntUserId) {
+            if (await redisClient.get(hashKey) === hash) {
+                return {action: 'unchanged'};
+            }
             try {
                 await updateNetHuntRecord(cachedNetHuntUserId, record);
+                await redisClient.set(hashKey, hash, {EX: appConfig.cacheTtlSeconds});
                 return {action: 'updated'};
             } catch (err) {
                 if (!isRecordGone(err)) throw err;
@@ -666,15 +720,21 @@ async function processRecord(record) {
             }
         }
 
-        const [existing] = await searchNetHuntRecord(record.FundistUserID);
+        // the page-level pass already established this user has no record, so
+        // asking again would double the cost of a backfill for no new answer
+        const [existing] = absent.has(String(record.FundistUserID))
+            ? []
+            : await searchNetHuntRecord(record.FundistUserID);
         if (existing) {
             await updateNetHuntRecord(existing.id, record);
             await cacheRecordId(record.FundistUserID, existing.id);
+            await redisClient.set(hashKey, hash, {EX: appConfig.cacheTtlSeconds});
             return {action: 'updated'};
         }
 
         const {recordId} = await createNetHuntRecord(record);
         await cacheRecordId(record.FundistUserID, recordId);
+        await redisClient.set(hashKey, hash, {EX: appConfig.cacheTtlSeconds});
         return {action: 'created'};
     } catch (err) {
         console.error(`Error processing ${record.FundistUserID}:`, {
@@ -688,6 +748,13 @@ async function processRecord(record) {
 function isRecordGone(err) {
     return STALE_RECORD_STATUSES.includes(err.response?.status);
 }
+
+// The ClickHouse window catches any change to LastUpdated, including ones in
+// columns the sync does not carry. Comparing the payload avoids paying a write
+// for those -- and makes an interrupted backfill cheap to resume, since already
+// synced users cost a Redis read and nothing else.
+const payloadHash = (payload) =>
+    crypto.createHash('sha1').update(JSON.stringify(payload)).digest('base64');
 
 async function cacheRecordId(fundistUserId, recordId) {
     if (!recordId) {
@@ -790,6 +857,54 @@ function recordPayload(record) {
     };
 }
 
+// One filter answers for a whole page of users. A number field has no _any
+// operator, but an _or of equalities does the same job, turning a hundred
+// lookups into a single request -- which is what makes a backfill feasible.
+async function resolveKnownIds(records) {
+    // ids this pass proved are absent from the CRM, so the per-record path can
+    // create them without asking again
+    const absent = new Set();
+
+    const ids = records.map(r => String(r.FundistUserID));
+    if (!ids.length) return absent;
+
+    const cached = await redisClient.mGet(ids);
+    const missing = ids.filter((_, i) => !cached[i]);
+    if (!missing.length) return absent;
+
+    const key = fieldIds.records.get('FundistUserID');
+    let found = 0;
+
+    for (let i = 0; i < missing.length; i += 100) {
+        const slice = missing.slice(i, i + 100);
+        const data = await netHunt('post', `/folders/${recordsFolder()}/records/filter`, {
+            body: {filter: {_or: slice.map(id => ({[key.id]: coerce(id, key.valueType)}))}},
+            params: {limit: slice.length}
+        });
+
+        const seen = new Set();
+        for (const record of data.records || []) {
+            const fundistId = record.fields?.[key.id];
+            if (fundistId !== undefined && record.id) {
+                await cacheRecordId(String(fundistId), record.id);
+                seen.add(String(fundistId));
+                found++;
+            }
+        }
+        for (const id of slice) {
+            if (!seen.has(id)) absent.add(id);
+        }
+    }
+
+    console.log(
+        `Resolved ${found} of ${missing.length} unknown ids in ` +
+        `${Math.ceil(missing.length / 100)} request(s); ${absent.size} are new`
+    );
+    return absent;
+}
+
+// Still needed on its own: a cached id that turns out to be gone has to be
+// re-resolved for that one record, outside the page-level pass above.
 async function searchNetHuntRecord(userId) {
     const key = fieldIds.records.get('FundistUserID');
     const data = await netHunt('post', `/folders/${recordsFolder()}/records/filter`, {
@@ -881,8 +996,8 @@ async function withRetry(fn, config) {
     }
 }
 
-function logProgress(total, created, updated) {
-    const line = `Progress: ${total} | Created: ${created} | Updated: ${updated}`;
+function logProgress(total, created, updated, skipped = 0) {
+    const line = `Progress: ${total} | Created: ${created} | Updated: ${updated} | Unchanged: ${skipped}`;
     if (process.stdout.isTTY) {
         process.stdout.clearLine();
         process.stdout.cursorTo(0);
