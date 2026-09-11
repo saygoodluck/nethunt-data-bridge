@@ -166,7 +166,7 @@ const fieldIds = {records: new Map(), utils: new Map()};
 const RECORD_FIELD_NAMES = [
     'FundistUserID', 'Login', 'FirstName', 'LastName', 'Email', 'PhoneNumber',
     'PhoneVerified', 'DateOfBirth', 'Gender', 'Language', 'Country', 'City',
-    'Timezone', 'FirstDepositDate', 'LastCreditDate', 'RegistrationDate',
+    'Timezone', 'FirstCreditDate', 'LastCreditDate', 'RegistrationDate',
     'LastLoginDate', 'PEP', 'AccountStatus', 'TotalDeposit', 'TotalWithdraw'
 ];
 const UTILS_FIELD_NAMES = [
@@ -179,7 +179,7 @@ const NUMERIC_FIELDS = ['FundistUserID', 'TotalDeposit', 'TotalWithdraw'];
 // values the sync sends as plain strings; a real date field would demand
 // epoch milliseconds instead and reject every write
 const DATE_LIKE_FIELDS = [
-    'DateOfBirth', 'FirstDepositDate', 'LastCreditDate', 'RegistrationDate',
+    'DateOfBirth', 'FirstCreditDate', 'LastCreditDate', 'RegistrationDate',
     'LastLoginDate'
 ];
 
@@ -1056,7 +1056,7 @@ function mapRecordFields(record) {
         Country: record.Country,
         City: record.City,
         Timezone: record.Timezone,
-        FirstDepositDate: record.FirstDepositDate,
+        FirstCreditDate: record.FirstCreditDate,
         LastCreditDate: record.LastCreditDate,
         RegistrationDate: record.RegistrationDate,
         LastLoginDate: record.LastLoginDate,
@@ -1136,7 +1136,7 @@ const clickHouseQuery = `
            -- The team asked for "First Time Deposit". FirstCreditDate is the
            -- platform's name for it and sits beside LastCreditDate, which is
            -- already read, so this costs nothing extra in ClickHouse.
-           argMax(uh.FirstCreditDate, uh.RecordTime) AS FirstDepositDate,
+           argMax(uh.FirstCreditDate, uh.RecordTime) AS FirstCreditDate,
            argMax(uh.LastCreditDate, uh.RecordTime) AS LastCreditDate,
            argMax(uh.RegistrationDate, uh.RecordTime) AS RegistrationDate,
            argMax(uh.LastLoginDate, uh.RecordTime) AS LastLoginDate,

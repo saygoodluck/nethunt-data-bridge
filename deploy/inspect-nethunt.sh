@@ -95,7 +95,7 @@ PY
 # on purpose: in v2 the display name is the special `name` key, not a field.
 RECORD_FIELDS="FundistUserID Login FirstName LastName Email PhoneNumber \
 PhoneVerified DateOfBirth Gender Language Country City Timezone \
-FirstDepositDate LastCreditDate RegistrationDate LastLoginDate PEP AccountStatus \
+FirstCreditDate LastCreditDate RegistrationDate LastLoginDate PEP AccountStatus \
 TotalDeposit TotalWithdraw"
 UTILS_FIELDS="finishedAt totalSynced duration createdRecords updatedRecords errorMessage"
 
@@ -124,7 +124,7 @@ import json, os, sys
 
 # the sync sends these as JSON numbers, and as plain strings respectively
 NUMERIC = {'FundistUserID', 'TotalDeposit', 'TotalWithdraw'}
-DATE_LIKE = {'DateOfBirth', 'FirstDepositDate', 'LastCreditDate', 'RegistrationDate', 'LastLoginDate'}
+DATE_LIKE = {'DateOfBirth', 'FirstCreditDate', 'LastCreditDate', 'RegistrationDate', 'LastLoginDate'}
 
 try:
     folder = json.loads(os.environ['SCHEMA_JSON'])
