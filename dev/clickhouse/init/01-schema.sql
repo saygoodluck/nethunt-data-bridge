@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS analytics.UserHistory
     CountryID        UInt32,
     City             String,
     Timezone         String,
+    FirstCreditDate  DateTime,
     LastCreditDate   DateTime,
     RegistrationDate DateTime,
     LastLoginDate    DateTime,

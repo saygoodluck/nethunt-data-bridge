@@ -36,7 +36,8 @@ const folderDefs = {
             ['PhoneNumber', ...TEXT], ['PhoneVerified', ...TEXT],
             ['DateOfBirth', ...TEXT], ['Gender', ...TEXT], ['Language', ...TEXT],
             ['City', ...TEXT], ['Timezone', ...TEXT], ['Country', ...TEXT],
-            ['LastCreditDate', ...TEXT], ['RegistrationDate', ...TEXT],
+            ['FirstDepositDate', ...TEXT], ['LastCreditDate', ...TEXT],
+            ['RegistrationDate', ...TEXT],
             ['LastLoginDate', ...TEXT], ['PEP', ...TEXT], ['AccountStatus', ...TEXT],
             ['TotalDeposit', ...NUM], ['TotalWithdraw', ...NUM],
             // owned by the team; the sync must never touch it

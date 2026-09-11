@@ -24,6 +24,7 @@ SELECT
     if(UserID = 7, 9999, toUInt32(UserID % 5) + 1)          AS CountryID,
     if(number % 3 = 2, arrayElement(['Warsaw', 'Kyiv', 'Berlin', 'Toronto'], toInt32(UserID % 4) + 1), 'STALE-City') AS City,
     'Europe/Warsaw'                                         AS Timezone,
+    now() - INTERVAL toUInt32(UserID % 400) DAY             AS FirstCreditDate,
     now() - INTERVAL toUInt32(UserID % 48) HOUR             AS LastCreditDate,
     now() - INTERVAL toUInt32(UserID % 365) DAY             AS RegistrationDate,
     now() - INTERVAL toUInt32(UserID % 72) HOUR             AS LastLoginDate,

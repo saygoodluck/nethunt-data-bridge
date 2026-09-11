@@ -166,8 +166,8 @@ const fieldIds = {records: new Map(), utils: new Map()};
 const RECORD_FIELD_NAMES = [
     'FundistUserID', 'Login', 'FirstName', 'LastName', 'Email', 'PhoneNumber',
     'PhoneVerified', 'DateOfBirth', 'Gender', 'Language', 'Country', 'City',
-    'Timezone', 'LastCreditDate', 'RegistrationDate', 'LastLoginDate', 'PEP',
-    'AccountStatus', 'TotalDeposit', 'TotalWithdraw'
+    'Timezone', 'FirstDepositDate', 'LastCreditDate', 'RegistrationDate',
+    'LastLoginDate', 'PEP', 'AccountStatus', 'TotalDeposit', 'TotalWithdraw'
 ];
 const UTILS_FIELD_NAMES = [
     'finishedAt', 'totalSynced', 'duration', 'createdRecords',
@@ -179,7 +179,8 @@ const NUMERIC_FIELDS = ['FundistUserID', 'TotalDeposit', 'TotalWithdraw'];
 // values the sync sends as plain strings; a real date field would demand
 // epoch milliseconds instead and reject every write
 const DATE_LIKE_FIELDS = [
-    'DateOfBirth', 'LastCreditDate', 'RegistrationDate', 'LastLoginDate'
+    'DateOfBirth', 'FirstDepositDate', 'LastCreditDate', 'RegistrationDate',
+    'LastLoginDate'
 ];
 
 // NetHunt bills by requests per minute and answers 429 past the allowance.
@@ -1055,6 +1056,7 @@ function mapRecordFields(record) {
         Country: record.Country,
         City: record.City,
         Timezone: record.Timezone,
+        FirstDepositDate: record.FirstDepositDate,
         LastCreditDate: record.LastCreditDate,
         RegistrationDate: record.RegistrationDate,
         LastLoginDate: record.LastLoginDate,
@@ -1131,6 +1133,10 @@ const clickHouseQuery = `
            argMax(c.Name, uh.RecordTime) AS Country,
            argMax(uh.City, uh.RecordTime) AS City,
            argMax(uh.Timezone, uh.RecordTime) AS Timezone,
+           -- The team asked for "First Time Deposit". FirstCreditDate is the
+           -- platform's name for it and sits beside LastCreditDate, which is
+           -- already read, so this costs nothing extra in ClickHouse.
+           argMax(uh.FirstCreditDate, uh.RecordTime) AS FirstDepositDate,
            argMax(uh.LastCreditDate, uh.RecordTime) AS LastCreditDate,
            argMax(uh.RegistrationDate, uh.RecordTime) AS RegistrationDate,
            argMax(uh.LastLoginDate, uh.RecordTime) AS LastLoginDate,
