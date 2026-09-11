@@ -884,15 +884,24 @@ async function loadFolderSchema(folderId, expectedNames, label) {
         return [name, {id: field.id, valueType: field.valueType}];
     }));
 
-    // A date field wants epoch milliseconds; the sync sends formatted strings,
-    // so such a field would reject every write. Worth stopping for.
-    const wrongDates = DATE_LIKE_FIELDS
-        .filter(name => byName.has(name) && ['DATE', 'TIME'].includes(byName.get(name).valueType));
-    if (wrongDates.length) {
+    // Date fields are converted to epoch milliseconds on the way out, so they
+    // are fine -- as long as the field really does hold a date. A date type on
+    // anything else would receive a parse of text that is not one.
+    const unexpectedDates = expectedNames.filter(name =>
+        !DATE_LIKE_FIELDS.includes(name)
+        && byName.has(name)
+        && ['DATE', 'TIME'].includes(byName.get(name).valueType));
+    if (unexpectedDates.length) {
         throw new Error(
-            `NetHunt fields ${wrongDates.join(', ')} are date fields, but the sync sends text. ` +
-            `Recreate them as text, or convert the values to epoch milliseconds first.`
+            `NetHunt fields ${unexpectedDates.join(', ')} are date fields, but the sync does ` +
+            `not send dates for them. Change their type, or the values will not survive.`
         );
+    }
+
+    const asDates = DATE_LIKE_FIELDS
+        .filter(name => byName.has(name) && ['DATE', 'TIME'].includes(byName.get(name).valueType));
+    if (asDates.length) {
+        console.log(`  sending as epoch milliseconds: ${asDates.join(', ')}`);
     }
 
     // Values are coerced to the declared type on the way out, so a mismatch is
@@ -920,7 +929,29 @@ async function loadNetHuntSchema() {
 // Matches the value to what the field actually declares. ClickHouse hands us
 // numbers for the money columns, but those fields may well have been created as
 // text; sending the wrong shape is rejected outright, so convert instead.
+// ClickHouse runs in Etc/UTC and formats DateTime without a zone, so the
+// strings it returns are UTC and can be read as such. NetHunt wants epoch
+// milliseconds for its date types, and a `date` field additionally insists the
+// value land exactly on UTC midnight -- anything else is rejected outright.
+function toEpochMs(value, wholeDayOnly) {
+    if (typeof value === 'number') return value;
+
+    const text = String(value).trim();
+    // 'YYYY-MM-DD' and 'YYYY-MM-DD HH:MM:SS' are what the query produces
+    const iso = text.includes(' ') ? text.replace(' ', 'T') + 'Z'
+        : /^\d{4}-\d{2}-\d{2}$/.test(text) ? text + 'T00:00:00Z'
+        : text;
+
+    const ms = Date.parse(iso);
+    if (!Number.isFinite(ms)) return null;
+    // floor to the start of the UTC day for a calendar-date field
+    return wholeDayOnly ? Math.floor(ms / 86400000) * 86400000 : ms;
+}
+
 function coerce(value, valueType) {
+    if (valueType === 'DATE' || valueType === 'TIME') {
+        return toEpochMs(value, valueType === 'DATE');
+    }
     if (valueType === 'NUMBER' && typeof value !== 'number') {
         const n = Number(value);
         return Number.isFinite(n) ? n : null;

@@ -213,7 +213,11 @@ upstream stays in the CRM until it is set to something again.
 leave the flag set on someone who stopped being one, which is the wrong way
 round for a compliance marker.
 
-Dates are sent as `YYYY-MM-DD HH:MM:SS` strings, so those fields must be text.
+Date fields may be either text or a real date type; the service adapts to what
+the folder declares, so they can be converted one at a time. A `date` or
+`dateTime` field receives epoch milliseconds, and a `date` additionally has to
+land exactly on UTC midnight or the write is rejected. ClickHouse runs in
+Etc/UTC, so the timestamps it returns are read as UTC with no conversion.
 A real date field expects epoch milliseconds and would reject every write; the
 service refuses to start if it finds one, rather than failing per record.
 

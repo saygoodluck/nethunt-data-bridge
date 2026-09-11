@@ -26,6 +26,8 @@ const PORT = Number(process.env.PORT) || 3010;
 // Field types mirror the real tenant.
 const TEXT = ['singleLineText', 'STRING'];
 const NUM = ['number', 'NUMBER'];
+const DATE = ['date', 'DATE'];
+const DATETIME = ['dateTime', 'TIME'];
 
 const folderDefs = {
     users: {
@@ -34,9 +36,9 @@ const folderDefs = {
             ['Name', ...TEXT], ['FundistUserID', ...NUM], ['Login', ...TEXT],
             ['FirstName', ...TEXT], ['LastName', ...TEXT], ['Email', ...TEXT],
             ['PhoneNumber', ...TEXT], ['PhoneVerified', ...TEXT],
-            ['DateOfBirth', ...TEXT], ['Gender', ...TEXT], ['Language', ...TEXT],
+            ['DateOfBirth', ...DATE], ['Gender', ...TEXT], ['Language', ...TEXT],
             ['City', ...TEXT], ['Timezone', ...TEXT], ['Country', ...TEXT],
-            ['FirstCreditDate', ...TEXT], ['LastCreditDate', ...TEXT],
+            ['FirstCreditDate', ...TEXT], ['LastCreditDate', ...DATETIME],
             ['RegistrationDate', ...TEXT],
             ['LastLoginDate', ...TEXT], ['PEP', ...TEXT], ['AccountStatus', ...TEXT],
             ['TotalDeposit', ...NUM], ['TotalWithdraw', ...NUM],
@@ -119,6 +121,24 @@ const matches = (record, filter) => Object.entries(filter || {}).every(([key, co
     }
     return String(value) === String(cond);
 });
+
+// A date field takes epoch milliseconds, and a calendar date must land exactly
+// on UTC midnight -- the real API rejects anything else, so the contour does too.
+const checkDates = (folderId, fields) => {
+    for (const field of folders[folderId]?.fields || []) {
+        const value = (fields || {})[field.id];
+        if (value === undefined) continue;
+        if (field.valueType !== 'DATE' && field.valueType !== 'TIME') continue;
+
+        if (typeof value !== 'number') {
+            return `${field.name} expects epoch milliseconds, got ${typeof value}`;
+        }
+        if (field.valueType === 'DATE' && value % 86400000 !== 0) {
+            return `${field.name} is a calendar date and must be UTC midnight`;
+        }
+    }
+    return null;
+};
 
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -283,6 +303,9 @@ const server = http.createServer(async (req, res) => {
                     message: `Wrong value in column [${empty[0]}]`
                 });
             }
+
+            const badDate = checkDates(folderId, body.fields);
+            if (badDate) return json(res, 400, {error: 'INVALID_REQUEST', message: badDate});
 
             const now = Date.now();
             const id = `rec_${nextId++}`;
